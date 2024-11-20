@@ -265,8 +265,6 @@ pub(crate) struct InnerSegmentUpdater {
     // This should be up to date as all update happen through
     // the unique active `SegmentUpdater`.
     active_index_meta: RwLock<Arc<IndexMeta>>,
-    pool: ThreadPool,
-    merge_thread_pool: ThreadPool,
 
     index: Index,
     segment_manager: SegmentManager,
@@ -284,29 +282,9 @@ impl SegmentUpdater {
     ) -> crate::Result<SegmentUpdater> {
         let segments = index.searchable_segment_metas()?;
         let segment_manager = SegmentManager::from_segments(segments, delete_cursor);
-        let pool = ThreadPoolBuilder::new()
-            .thread_name(|_| "segment_updater".to_string())
-            .num_threads(1)
-            .build()
-            .map_err(|_| {
-                crate::TantivyError::SystemError(
-                    "Failed to spawn segment updater thread".to_string(),
-                )
-            })?;
-        let merge_thread_pool = ThreadPoolBuilder::new()
-            .thread_name(|i| format!("merge_thread_{i}"))
-            .num_threads(NUM_MERGE_THREADS)
-            .build()
-            .map_err(|_| {
-                crate::TantivyError::SystemError(
-                    "Failed to spawn segment merging thread".to_string(),
-                )
-            })?;
         let index_meta = index.load_metas()?;
         Ok(SegmentUpdater(Arc::new(InnerSegmentUpdater {
             active_index_meta: RwLock::new(Arc::new(index_meta)),
-            pool,
-            merge_thread_pool,
             index,
             segment_manager,
             merge_policy: RwLock::new(Arc::new(DefaultMergePolicy::default())),
@@ -335,7 +313,7 @@ impl SegmentUpdater {
         let (scheduled_result, sender) = FutureResult::create(
             "A segment_updater future did not succeed. This should never happen.",
         );
-        self.pool.spawn(|| {
+        rayon::spawn(|| {
             let task_result = task();
             let _ = sender.send(task_result);
         });
@@ -510,7 +488,7 @@ impl SegmentUpdater {
         let (scheduled_result, merging_future_send) =
             FutureResult::create("Merge operation failed.");
 
-        self.merge_thread_pool.spawn(move || {
+        rayon::spawn(move || {
             // The fact that `merge_operation` is moved here is important.
             // Its lifetime is used to track how many merging thread are currently running,
             // as well as which segment is currently in merge and therefore should not be
