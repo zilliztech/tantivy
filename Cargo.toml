@@ -20,7 +20,10 @@ base64 = "0.21.0"
 byteorder = "1.4.3"
 crc32fast = "1.3.2"
 once_cell = "1.10.0"
-regex = { version = "1.5.5", default-features = false, features = ["std", "unicode"] }
+regex = { version = "1.5.5", default-features = false, features = [
+    "std",
+    "unicode",
+] }
 aho-corasick = "1.0"
 tantivy-fst = "0.4.0"
 memmap2 = { version = "0.7.1", optional = true }
@@ -37,7 +40,10 @@ uuid = { version = "1.0.0", features = ["v4", "serde"] }
 crossbeam-channel = "0.5.4"
 rust-stemmers = "1.2.0"
 downcast-rs = "1.2.0"
-bitpacking = { version = "0.8.4", default-features = false, features = ["bitpacker4x"] }
+bitpacking = { version = "0.8.4", default-features = false, features = [
+    "bitpacker4x",
+] }
+zstd-sys = "=2.0.9"
 census = "0.4.0"
 rustc-hash = "1.1.0"
 thiserror = "1.0.30"
@@ -54,15 +60,16 @@ measure_time = "0.8.2"
 async-trait = "0.1.53"
 arc-swap = "1.5.0"
 
-columnar = { version= "0.2", path="./columnar", package ="tantivy-columnar" }
-sstable = { version= "0.2", path="./sstable", package ="tantivy-sstable", optional = true }
-stacker = { version= "0.2", path="./stacker", package ="tantivy-stacker" }
-query-grammar = { version= "0.21.0", path="./query-grammar", package = "tantivy-query-grammar" }
-tantivy-bitpacker = { version= "0.5", path="./bitpacker" }
-common = { version= "0.6", path = "./common/", package = "tantivy-common" }
-tokenizer-api = { version= "0.2", path="./tokenizer-api", package="tantivy-tokenizer-api" }
+columnar = { version = "0.2", path = "./columnar", package = "tantivy-columnar" }
+sstable = { version = "0.2", path = "./sstable", package = "tantivy-sstable", optional = true }
+stacker = { version = "0.2", path = "./stacker", package = "tantivy-stacker" }
+query-grammar = { version = "0.21.0", path = "./query-grammar", package = "tantivy-query-grammar" }
+tantivy-bitpacker = { version = "0.5", path = "./bitpacker" }
+common = { version = "0.6", path = "./common/", package = "tantivy-common" }
+tokenizer-api = { version = "0.2", path = "./tokenizer-api", package = "tantivy-tokenizer-api" }
 sketches-ddsketch = { version = "0.2.1", features = ["use_serde"] }
 futures-util = { version = "0.3.28", optional = true }
+lazy_static = "1.5.0"
 
 [target.'cfg(windows)'.dependencies]
 winapi = "0.3.9"
@@ -82,7 +89,10 @@ rand_distr = "0.4.3"
 
 [target.'cfg(not(windows))'.dev-dependencies]
 criterion = "0.5"
-pprof = { git = "https://github.com/PSeitz/pprof-rs/", rev = "53af24b", features = ["flamegraph", "criterion"] } # temp fork that works with criterion 0.5
+pprof = { git = "https://github.com/PSeitz/pprof-rs/", rev = "53af24b", features = [
+    "flamegraph",
+    "criterion",
+] } # temp fork that works with criterion 0.5
 
 [dev-dependencies.fail]
 version = "0.5.0"
@@ -111,12 +121,21 @@ lz4-compression = ["lz4_flex"]
 zstd-compression = ["zstd"]
 
 failpoints = ["fail", "fail/failpoints"]
-unstable = [] # useful for benches.
+unstable = []                            # useful for benches.
 
 quickwit = ["sstable", "futures-util"]
 
 [workspace]
-members = ["query-grammar", "bitpacker", "common", "ownedbytes", "stacker", "sstable", "tokenizer-api", "columnar"]
+members = [
+    "query-grammar",
+    "bitpacker",
+    "common",
+    "ownedbytes",
+    "stacker",
+    "sstable",
+    "tokenizer-api",
+    "columnar",
+]
 
 # Following the "fail" crate best practises, we isolate
 # tests that define specific behavior in fail check points

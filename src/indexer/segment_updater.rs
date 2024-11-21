@@ -8,6 +8,7 @@ use std::sync::{Arc, RwLock};
 
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
+use super::pool;
 use super::segment_manager::SegmentManager;
 use crate::core::{
     Index, IndexMeta, IndexSettings, Segment, SegmentId, SegmentMeta, META_FILEPATH,
@@ -265,6 +266,8 @@ pub(crate) struct InnerSegmentUpdater {
     // This should be up to date as all update happen through
     // the unique active `SegmentUpdater`.
     active_index_meta: RwLock<Arc<IndexMeta>>,
+    pool: &'static ThreadPool,
+    merge_thread_pool: &'static ThreadPool,
 
     index: Index,
     segment_manager: SegmentManager,
@@ -285,6 +288,8 @@ impl SegmentUpdater {
         let index_meta = index.load_metas()?;
         Ok(SegmentUpdater(Arc::new(InnerSegmentUpdater {
             active_index_meta: RwLock::new(Arc::new(index_meta)),
+            pool: &pool::WRITER_THREAD_POOL,
+            merge_thread_pool: &pool::MERGER_THREAD_POOL,
             index,
             segment_manager,
             merge_policy: RwLock::new(Arc::new(DefaultMergePolicy::default())),
@@ -313,7 +318,7 @@ impl SegmentUpdater {
         let (scheduled_result, sender) = FutureResult::create(
             "A segment_updater future did not succeed. This should never happen.",
         );
-        rayon::spawn(|| {
+        self.pool.spawn(|| {
             let task_result = task();
             let _ = sender.send(task_result);
         });
@@ -488,7 +493,7 @@ impl SegmentUpdater {
         let (scheduled_result, merging_future_send) =
             FutureResult::create("Merge operation failed.");
 
-        rayon::spawn(move || {
+        self.merge_thread_pool.spawn(move || {
             // The fact that `merge_operation` is moved here is important.
             // Its lifetime is used to track how many merging thread are currently running,
             // as well as which segment is currently in merge and therefore should not be
