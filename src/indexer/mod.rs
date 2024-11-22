@@ -29,7 +29,6 @@ pub(crate) mod segment_writer;
 pub(crate) mod single_segment_index_writer;
 mod stamper;
 
-use crossbeam_channel as channel;
 use smallvec::SmallVec;
 
 pub use self::index_writer::{IndexWriter, IndexWriterOptions};
@@ -40,7 +39,7 @@ use self::operation::AddOperation;
 pub use self::operation::UserOperation;
 pub use self::prepared_commit::PreparedCommit;
 pub use self::segment_entry::SegmentEntry;
-pub(crate) use self::segment_serializer::SegmentSerializer;
+pub use self::segment_serializer::SegmentSerializer;
 pub use self::segment_updater::{merge_filtered_segments, merge_indices};
 pub use self::segment_writer::SegmentWriter;
 pub use self::single_segment_index_writer::SingleSegmentIndexWriter;
@@ -55,8 +54,8 @@ pub type DefaultMergePolicy = LogMergePolicy;
 // - all operations in the group are committed at the same time, making the group
 // atomic.
 type AddBatch<D> = SmallVec<[AddOperation<D>; 4]>;
-type AddBatchSender<D> = channel::Sender<AddBatch<D>>;
-type AddBatchReceiver<D> = channel::Receiver<AddBatch<D>>;
+type AddBatchSender<D> = async_channel::Sender<AddBatch<D>>;
+type AddBatchReceiver<D> = async_channel::Receiver<AddBatch<D>>;
 
 #[cfg(feature = "mmap")]
 #[cfg(test)]
