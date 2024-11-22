@@ -92,7 +92,7 @@ impl Drop for IndexWriterBomb {
 mod tests {
     use std::mem;
 
-    use crossbeam_channel as channel;
+    use async_channel as channel;
 
     use super::IndexWriterStatus;
 
