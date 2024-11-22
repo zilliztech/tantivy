@@ -4,9 +4,10 @@ use std::thread;
 use std::thread::JoinHandle;
 
 use common::BitSet;
-use smallvec::smallvec;
+use smallvec::{smallvec, SmallVec};
 
 use super::operation::{AddOperation, UserOperation};
+use super::pool::TOKIO_RUNTIME;
 use super::segment_updater::SegmentUpdater;
 use super::{AddBatch, AddBatchReceiver, AddBatchSender, PreparedCommit};
 use crate::core::{Index, Segment, SegmentComponent, SegmentId, SegmentMeta, SegmentReader};
@@ -60,10 +61,10 @@ pub struct IndexWriter {
     // The memory budget per thread, after which a commit is triggered.
     memory_budget_in_bytes_per_thread: usize,
 
-    workers_join_handle: Vec<JoinHandle<crate::Result<()>>>,
+    workers_join_handle: Vec<tokio::task::JoinHandle<Result<(), TantivyError>>>,
 
     index_writer_status: IndexWriterStatus,
-    operation_sender: AddBatchSender,
+    operation_sender: Arc<AddBatchSender>,
 
     segment_updater: SegmentUpdater,
 
@@ -164,26 +165,34 @@ pub(crate) fn advance_deletes(
     Ok(())
 }
 
-fn index_documents(
+async fn index_documents(
     memory_budget: usize,
     segment: Segment,
-    grouped_document_iterator: &mut dyn Iterator<Item = AddBatch>,
+    first_batch: AddBatch,
+    receiver: &AddBatchReceiver,
     segment_updater: &SegmentUpdater,
     mut delete_cursor: DeleteCursor,
 ) -> crate::Result<()> {
     let mut segment_writer = SegmentWriter::for_segment(memory_budget, segment.clone())?;
-    for document_group in grouped_document_iterator {
-        for doc in document_group {
-            segment_writer.add_document(doc)?;
+    for doc in first_batch {
+        segment_writer.add_document(doc)?;
+    }
+    loop {
+        if let Ok(document_group) = receiver.recv().await {
+            for doc in document_group {
+                segment_writer.add_document(doc)?;
+            }
+            let mem_usage = segment_writer.mem_usage();
+            if mem_usage >= memory_budget - MARGIN_IN_BYTES {
+                info!(
+                    "Buffer limit reached, flushing segment with maxdoc={}.",
+                    segment_writer.max_doc()
+                );
+                break;
+            }
+            continue;
         }
-        let mem_usage = segment_writer.mem_usage();
-        if mem_usage >= memory_budget - MARGIN_IN_BYTES {
-            info!(
-                "Buffer limit reached, flushing segment with maxdoc={}.",
-                segment_writer.max_doc()
-            );
-            break;
-        }
+        break;
     }
 
     if !segment_updater.is_alive() {
@@ -282,7 +291,7 @@ impl IndexWriter {
             return Err(TantivyError::InvalidArgument(err_msg));
         }
         let (document_sender, document_receiver): (AddBatchSender, AddBatchReceiver) =
-            crossbeam_channel::bounded(PIPELINE_MAX_SIZE_IN_DOCS);
+            async_channel::bounded(PIPELINE_MAX_SIZE_IN_DOCS);
 
         let delete_queue = DeleteQueue::new();
 
@@ -299,7 +308,7 @@ impl IndexWriter {
             memory_budget_in_bytes_per_thread,
             index: index.clone(),
             index_writer_status: IndexWriterStatus::from(document_receiver),
-            operation_sender: document_sender,
+            operation_sender: Arc::new(document_sender),
 
             segment_updater,
 
@@ -318,8 +327,8 @@ impl IndexWriter {
     }
 
     fn drop_sender(&mut self) {
-        let (sender, _receiver) = crossbeam_channel::bounded(1);
-        self.operation_sender = sender;
+        let (sender, _receiver) = async_channel::bounded(1);
+        self.operation_sender = Arc::new(sender);
     }
 
     /// Accessor to the index.
@@ -336,8 +345,8 @@ impl IndexWriter {
 
         let former_workers_handles = std::mem::take(&mut self.workers_join_handle);
         for join_handle in former_workers_handles {
-            join_handle
-                .join()
+            TOKIO_RUNTIME
+                .block_on(join_handle)
                 .map_err(|_| error_in_index_worker_thread("Worker thread panicked."))?
                 .map_err(|_| error_in_index_worker_thread("Worker thread failed."))?;
         }
@@ -399,24 +408,26 @@ impl IndexWriter {
 
         let mem_budget = self.memory_budget_in_bytes_per_thread;
         let index = self.index.clone();
-        let join_handle: JoinHandle<crate::Result<()>> = thread::Builder::new()
-            .name(format!("thrd-tantivy-index{}", self.worker_id))
-            .spawn(move || {
-                loop {
-                    let mut document_iterator = document_receiver_clone
-                        .clone()
-                        .into_iter()
-                        .filter(|batch| !batch.is_empty())
-                        .peekable();
 
+        let join_handle = TOKIO_RUNTIME.spawn(async move {
+            loop {
+                let first_batch;
+                loop {
                     // The peeking here is to avoid creating a new segment's files
                     // if no document are available.
                     //
                     // This is a valid guarantee as the peeked document now belongs to
                     // our local iterator.
-                    if let Some(batch) = document_iterator.peek() {
-                        assert!(!batch.is_empty());
-                        delete_cursor.skip_to(batch[0].opstamp);
+                    if let Ok(batch) = document_receiver_clone.recv().await {
+                        if batch.is_empty() {
+                            // ignore the empty batch.
+                            continue;
+                        } else {
+                            delete_cursor.skip_to(batch[0].opstamp);
+                            // update the delete cursor
+                            first_batch = batch;
+                            break;
+                        }
                     } else {
                         // No more documents.
                         // It happens when there is a commit, or if the `IndexWriter`
@@ -424,16 +435,18 @@ impl IndexWriter {
                         index_writer_bomb.defuse();
                         return Ok(());
                     }
-
-                    index_documents(
-                        mem_budget,
-                        index.new_segment(),
-                        &mut document_iterator,
-                        &segment_updater,
-                        delete_cursor.clone(),
-                    )?;
                 }
-            })?;
+                index_documents(
+                    mem_budget,
+                    index.new_segment(),
+                    first_batch,
+                    &document_receiver_clone,
+                    &segment_updater,
+                    delete_cursor.clone(),
+                )
+                .await?;
+            }
+        });
         self.worker_id += 1;
         self.workers_join_handle.push(join_handle);
         Ok(())
@@ -526,8 +539,8 @@ impl IndexWriter {
     /// Returns the former segment_ready channel.
     fn recreate_document_channel(&mut self) {
         let (document_sender, document_receiver): (AddBatchSender, AddBatchReceiver) =
-            crossbeam_channel::bounded(PIPELINE_MAX_SIZE_IN_DOCS);
-        self.operation_sender = document_sender;
+            async_channel::bounded(PIPELINE_MAX_SIZE_IN_DOCS);
+        self.operation_sender = Arc::new(document_sender);
         self.index_writer_status = IndexWriterStatus::from(document_receiver);
     }
 
@@ -570,9 +583,11 @@ impl IndexWriter {
         //
         // This will reach an end as the only document_sender
         // was dropped with the index_writer.
-        if let Ok(document_receiver) = document_receiver_res {
-            for _ in document_receiver {}
-        }
+        TOKIO_RUNTIME.block_on(async move {
+            if let Ok(document_receiver) = document_receiver_res {
+                while document_receiver.recv().await.is_ok() {}
+            }
+        });
 
         Ok(self.committed_opstamp)
     }
@@ -618,8 +633,8 @@ impl IndexWriter {
         let former_workers_join_handle = std::mem::take(&mut self.workers_join_handle);
 
         for worker_handle in former_workers_join_handle {
-            let indexing_worker_result = worker_handle
-                .join()
+            let indexing_worker_result = TOKIO_RUNTIME
+                .block_on(worker_handle)
                 .map_err(|e| TantivyError::ErrorInThread(format!("{e:?}")))?;
             indexing_worker_result?;
             self.add_indexing_worker()?;
@@ -779,11 +794,14 @@ impl IndexWriter {
     }
 
     fn send_add_documents_batch(&self, add_ops: AddBatch) -> crate::Result<()> {
-        if self.index_writer_status.is_alive() && self.operation_sender.send(add_ops).is_ok() {
-            Ok(())
-        } else {
-            Err(error_in_index_worker_thread("An index writer was killed."))
+        if self.index_writer_status.is_alive() {
+            let sender: Arc<async_channel::Sender<SmallVec<[AddOperation; 4]>>> =
+                Arc::clone(&self.operation_sender);
+            if TOKIO_RUNTIME.block_on(async move { sender.send(add_ops).await.is_ok() }) {
+                return Ok(());
+            }
         }
+        Err(error_in_index_worker_thread("An index writer was killed."))
     }
 }
 
@@ -792,7 +810,7 @@ impl Drop for IndexWriter {
         self.segment_updater.kill();
         self.drop_sender();
         for work in self.workers_join_handle.drain(..) {
-            let _ = work.join();
+            let _ = TOKIO_RUNTIME.block_on(work);
         }
     }
 }
@@ -2237,7 +2255,9 @@ mod tests {
                 assert!(is_sorted(&ids_in_segment));
 
                 fn is_sorted<T>(data: &[T]) -> bool
-                where T: Ord {
+                where
+                    T: Ord,
+                {
                     data.windows(2).all(|w| w[0] <= w[1])
                 }
             }
