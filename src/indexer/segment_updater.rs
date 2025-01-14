@@ -8,6 +8,7 @@ use std::sync::{Arc, RwLock};
 
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
+use super::pool;
 use super::segment_manager::SegmentManager;
 use crate::core::META_FILEPATH;
 use crate::directory::{Directory, DirectoryClone, GarbageCollectionResult};
@@ -255,8 +256,8 @@ pub(crate) struct InnerSegmentUpdater {
     // This should be up to date as all update happen through
     // the unique active `SegmentUpdater`.
     active_index_meta: RwLock<Arc<IndexMeta>>,
-    pool: ThreadPool,
-    merge_thread_pool: ThreadPool,
+    pool: &'static ThreadPool,
+    merge_thread_pool: &'static ThreadPool,
 
     index: Index,
     segment_manager: SegmentManager,
@@ -275,29 +276,11 @@ impl SegmentUpdater {
     ) -> crate::Result<SegmentUpdater> {
         let segments = index.searchable_segment_metas()?;
         let segment_manager = SegmentManager::from_segments(segments, delete_cursor);
-        let pool = ThreadPoolBuilder::new()
-            .thread_name(|_| "segment_updater".to_string())
-            .num_threads(1)
-            .build()
-            .map_err(|_| {
-                crate::TantivyError::SystemError(
-                    "Failed to spawn segment updater thread".to_string(),
-                )
-            })?;
-        let merge_thread_pool = ThreadPoolBuilder::new()
-            .thread_name(|i| format!("merge_thread_{i}"))
-            .num_threads(num_merge_threads)
-            .build()
-            .map_err(|_| {
-                crate::TantivyError::SystemError(
-                    "Failed to spawn segment merging thread".to_string(),
-                )
-            })?;
         let index_meta = index.load_metas()?;
         Ok(SegmentUpdater(Arc::new(InnerSegmentUpdater {
             active_index_meta: RwLock::new(Arc::new(index_meta)),
-            pool,
-            merge_thread_pool,
+            pool: &pool::WRITER_THREAD_POOL,
+            merge_thread_pool: &pool::MERGER_THREAD_POOL,
             index,
             segment_manager,
             merge_policy: RwLock::new(Arc::new(DefaultMergePolicy::default())),
