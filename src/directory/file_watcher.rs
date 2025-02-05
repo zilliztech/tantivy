@@ -18,6 +18,7 @@ pub struct FileWatcher {
     callbacks: Arc<WatchCallbackList>,
     state: Arc<AtomicUsize>, // 0: new, 1: runnable, 2: terminated
     watch_handle: RwLock<Option<JoinHandle<()>>>,
+    wakeup_channel: RwLock<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 impl FileWatcher {
@@ -27,6 +28,7 @@ impl FileWatcher {
             callbacks: Default::default(),
             state: Default::default(),
             watch_handle: RwLock::new(None),
+            wakeup_channel: RwLock::new(None),
         }
     }
 
@@ -43,6 +45,8 @@ impl FileWatcher {
         let callbacks = self.callbacks.clone();
         let state = self.state.clone();
 
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        self.wakeup_channel.write().unwrap().replace(tx);
         self.watch_handle.write().unwrap().replace(
             thread::Builder::new()
                 .name("thread-tantivy-meta-file-watcher".to_string())
@@ -63,7 +67,8 @@ impl FileWatcher {
                             }
                         }
 
-                        thread::sleep(POLLING_INTERVAL);
+                        // Use a channel to allow early wake up from sleep
+                        let _ = rx.recv_timeout(POLLING_INTERVAL);
                     }
                 })
                 .expect("Failed to spawn meta file watcher thread"),
@@ -99,6 +104,9 @@ impl Drop for FileWatcher {
     fn drop(&mut self) {
         self.state.store(2, Ordering::SeqCst);
         if let Some(handle) = self.watch_handle.write().unwrap().take() {
+            if let Some(channel) = self.wakeup_channel.write().unwrap().take() {
+                let _ = channel.send(());
+            }
             handle
                 .join()
                 .expect("Failed to join meta file watcher thread");
