@@ -1,7 +1,8 @@
 use std::io::BufRead;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::thread::JoinHandle;
 use std::time::Duration;
 use std::{fs, io, thread};
 
@@ -16,6 +17,8 @@ pub struct FileWatcher {
     path: Arc<Path>,
     callbacks: Arc<WatchCallbackList>,
     state: Arc<AtomicUsize>, // 0: new, 1: runnable, 2: terminated
+    watch_handle: RwLock<Option<JoinHandle<()>>>,
+    wakeup_channel: RwLock<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 impl FileWatcher {
@@ -24,6 +27,8 @@ impl FileWatcher {
             path: Arc::from(path),
             callbacks: Default::default(),
             state: Default::default(),
+            watch_handle: RwLock::new(None),
+            wakeup_channel: RwLock::new(None),
         }
     }
 
@@ -40,29 +45,34 @@ impl FileWatcher {
         let callbacks = self.callbacks.clone();
         let state = self.state.clone();
 
-        thread::Builder::new()
-            .name("thread-tantivy-meta-file-watcher".to_string())
-            .spawn(move || {
-                let mut current_checksum_opt = None;
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        self.wakeup_channel.write().unwrap().replace(tx);
+        self.watch_handle.write().unwrap().replace(
+            thread::Builder::new()
+                .name("thread-tantivy-meta-file-watcher".to_string())
+                .spawn(move || {
+                    let mut current_checksum_opt = None;
 
-                while state.load(Ordering::SeqCst) == 1 {
-                    if let Ok(checksum) = FileWatcher::compute_checksum(&path) {
-                        let metafile_has_changed = current_checksum_opt
-                            .map(|current_checksum| current_checksum != checksum)
-                            .unwrap_or(true);
-                        if metafile_has_changed {
-                            info!("Meta file {:?} was modified", path);
-                            current_checksum_opt = Some(checksum);
-                            // We actually ignore callbacks failing here.
-                            // We just wait for the end of their execution.
-                            let _ = callbacks.broadcast().wait();
+                    while state.load(Ordering::SeqCst) == 1 {
+                        if let Ok(checksum) = FileWatcher::compute_checksum(&path) {
+                            let metafile_has_changed = current_checksum_opt
+                                .map(|current_checksum| current_checksum != checksum)
+                                .unwrap_or(true);
+                            if metafile_has_changed {
+                                info!("Meta file {:?} was modified", path);
+                                current_checksum_opt = Some(checksum);
+                                // We actually ignore callbacks failing here.
+                                // We just wait for the end of their execution.
+                                let _ = callbacks.broadcast().wait();
+                            }
                         }
-                    }
 
-                    thread::sleep(POLLING_INTERVAL);
-                }
-            })
-            .expect("Failed to spawn meta file watcher thread");
+                        // Use a channel to allow early wake up from sleep
+                        let _ = rx.recv_timeout(POLLING_INTERVAL);
+                    }
+                })
+                .expect("Failed to spawn meta file watcher thread"),
+        );
     }
 
     pub fn watch(&self, callback: WatchCallback) -> WatchHandle {
@@ -93,6 +103,13 @@ impl FileWatcher {
 impl Drop for FileWatcher {
     fn drop(&mut self) {
         self.state.store(2, Ordering::SeqCst);
+        if let Some(handle) = self.watch_handle.write().unwrap().take() {
+            let _ = self.wakeup_channel.write().unwrap().take();
+            handle
+                .join()
+                .expect("Failed to join meta file watcher thread");
+            info!("Meta file watcher thread joined");
+        }
     }
 }
 
@@ -179,6 +196,34 @@ mod tests {
         atomic_write(&tmp_file, b"qux")?;
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert_eq!(state.load(Ordering::SeqCst), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_file_watcher_drop_handle_and_watcher() -> crate::Result<()> {
+        let tmp_dir = tempfile::TempDir::new()?;
+        let tmp_file = tmp_dir.path().join("watched.txt");
+
+        let watcher = FileWatcher::new(&tmp_file);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = watcher.watch(WatchCallback::new(move || {
+            assert!(tx.send(()).is_ok());
+            thread::sleep(Duration::from_secs(3));
+            assert!(tx.send(()).is_ok());
+        }));
+
+        // change the file
+        atomic_write(&tmp_file, b"foo")?;
+
+        // wait for the callback to be called
+        let timeout = Duration::from_secs(3);
+        assert!(rx.recv_timeout(timeout).is_ok());
+
+        mem::drop(watcher);
+        // check that the callback finished
+        assert!(rx.try_recv().is_ok());
 
         Ok(())
     }
