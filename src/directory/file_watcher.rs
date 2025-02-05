@@ -201,4 +201,32 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_file_watcher_drop_handle_and_watcher() -> crate::Result<()> {
+        let tmp_dir = tempfile::TempDir::new()?;
+        let tmp_file = tmp_dir.path().join("watched.txt");
+
+        let watcher = FileWatcher::new(&tmp_file);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = watcher.watch(WatchCallback::new(move || {
+            assert!(tx.send(()).is_ok());
+            thread::sleep(Duration::from_secs(3));
+            assert!(tx.send(()).is_ok());
+        }));
+
+        // change the file
+        atomic_write(&tmp_file, b"foo")?;
+
+        // wait for the callback to be called
+        let timeout = Duration::from_secs(3);
+        assert!(rx.recv_timeout(timeout).is_ok());
+
+        mem::drop(watcher);
+        // check that the callback finished
+        assert!(rx.try_recv().is_ok());
+
+        Ok(())
+    }
 }
