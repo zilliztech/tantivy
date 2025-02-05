@@ -1,7 +1,8 @@
 use std::io::BufRead;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::thread::JoinHandle;
 use std::time::Duration;
 use std::{fs, io, thread};
 
@@ -16,6 +17,7 @@ pub struct FileWatcher {
     path: Arc<Path>,
     callbacks: Arc<WatchCallbackList>,
     state: Arc<AtomicUsize>, // 0: new, 1: runnable, 2: terminated
+    watch_handle: RwLock<Option<JoinHandle<()>>>,
 }
 
 impl FileWatcher {
@@ -24,6 +26,7 @@ impl FileWatcher {
             path: Arc::from(path),
             callbacks: Default::default(),
             state: Default::default(),
+            watch_handle: RwLock::new(None),
         }
     }
 
@@ -40,29 +43,31 @@ impl FileWatcher {
         let callbacks = self.callbacks.clone();
         let state = self.state.clone();
 
-        thread::Builder::new()
-            .name("thread-tantivy-meta-file-watcher".to_string())
-            .spawn(move || {
-                let mut current_checksum_opt = None;
+        self.watch_handle.write().unwrap().replace(
+            thread::Builder::new()
+                .name("thread-tantivy-meta-file-watcher".to_string())
+                .spawn(move || {
+                    let mut current_checksum_opt = None;
 
-                while state.load(Ordering::SeqCst) == 1 {
-                    if let Ok(checksum) = FileWatcher::compute_checksum(&path) {
-                        let metafile_has_changed = current_checksum_opt
-                            .map(|current_checksum| current_checksum != checksum)
-                            .unwrap_or(true);
-                        if metafile_has_changed {
-                            info!("Meta file {:?} was modified", path);
-                            current_checksum_opt = Some(checksum);
-                            // We actually ignore callbacks failing here.
-                            // We just wait for the end of their execution.
-                            let _ = callbacks.broadcast().wait();
+                    while state.load(Ordering::SeqCst) == 1 {
+                        if let Ok(checksum) = FileWatcher::compute_checksum(&path) {
+                            let metafile_has_changed = current_checksum_opt
+                                .map(|current_checksum| current_checksum != checksum)
+                                .unwrap_or(true);
+                            if metafile_has_changed {
+                                info!("Meta file {:?} was modified", path);
+                                current_checksum_opt = Some(checksum);
+                                // We actually ignore callbacks failing here.
+                                // We just wait for the end of their execution.
+                                let _ = callbacks.broadcast().wait();
+                            }
                         }
-                    }
 
-                    thread::sleep(POLLING_INTERVAL);
-                }
-            })
-            .expect("Failed to spawn meta file watcher thread");
+                        thread::sleep(POLLING_INTERVAL);
+                    }
+                })
+                .expect("Failed to spawn meta file watcher thread"),
+        );
     }
 
     pub fn watch(&self, callback: WatchCallback) -> WatchHandle {
@@ -93,6 +98,12 @@ impl FileWatcher {
 impl Drop for FileWatcher {
     fn drop(&mut self) {
         self.state.store(2, Ordering::SeqCst);
+        if let Some(handle) = self.watch_handle.write().unwrap().take() {
+            handle
+                .join()
+                .expect("Failed to join meta file watcher thread");
+            info!("Meta file watcher thread joined");
+        }
     }
 }
 
