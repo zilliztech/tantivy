@@ -1,12 +1,13 @@
+use std::io;
 use std::io::Write;
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::thread::JoinHandle;
-use std::{io, thread};
+use std::sync::Arc;
 
 use common::{BinarySerializable, CountingWriter, TerminatingWrite};
+use tokio::task::JoinHandle;
 
 use super::DOC_STORE_VERSION;
 use crate::directory::WritePtr;
+use crate::indexer::TOKIO_DOCSTORE_COMPRESS_RUNTIME;
 use crate::store::footer::DocStoreFooter;
 use crate::store::index::{Checkpoint, SkipIndexBuilder};
 use crate::store::{Compressor, Decompressor, StoreReader};
@@ -37,7 +38,7 @@ impl BlockCompressor {
         }
     }
 
-    pub fn compress_block_and_write(
+    pub async fn compress_block_and_write(
         &mut self,
         bytes: &[u8],
         num_docs_in_block: u32,
@@ -48,30 +49,33 @@ impl BlockCompressor {
             }
             BlockCompressorVariants::DedicatedThread(different_thread_block_compressor) => {
                 different_thread_block_compressor
-                    .compress_block_and_write(bytes, num_docs_in_block)?;
+                    .schedule_compress_block_and_write(bytes, num_docs_in_block)
+                    .await?;
             }
         }
         Ok(())
     }
 
-    pub fn stack_reader(&mut self, store_reader: StoreReader) -> io::Result<()> {
+    pub async fn stack_reader(&mut self, store_reader: StoreReader) -> io::Result<()> {
         match &mut self.0 {
             BlockCompressorVariants::SameThread(block_compressor) => {
                 block_compressor.stack(store_reader)?;
             }
             BlockCompressorVariants::DedicatedThread(different_thread_block_compressor) => {
-                different_thread_block_compressor.stack_reader(store_reader)?;
+                different_thread_block_compressor
+                    .stack_reader(store_reader)
+                    .await?;
             }
         }
         Ok(())
     }
 
-    pub fn close(self) -> io::Result<()> {
+    pub async fn close(self) -> io::Result<()> {
         let imp = self.0;
         match imp {
             BlockCompressorVariants::SameThread(block_compressor) => block_compressor.close(),
             BlockCompressorVariants::DedicatedThread(different_thread_block_compressor) => {
-                different_thread_block_compressor.close()
+                different_thread_block_compressor.close().await
             }
         }
     }
@@ -166,63 +170,67 @@ enum BlockCompressorMessage {
 
 struct DedicatedThreadBlockCompressorImpl {
     join_handle: Option<JoinHandle<io::Result<()>>>,
-    tx: SyncSender<BlockCompressorMessage>,
+    tx: Arc<async_channel::Sender<BlockCompressorMessage>>,
 }
 
 impl DedicatedThreadBlockCompressorImpl {
     fn new(mut block_compressor: BlockCompressorImpl) -> io::Result<Self> {
         let (tx, rx): (
-            SyncSender<BlockCompressorMessage>,
-            Receiver<BlockCompressorMessage>,
-        ) = sync_channel(3);
-        let join_handle = thread::Builder::new()
-            .name("docstore-compressor-thread".to_string())
-            .spawn(move || {
-                while let Ok(packet) = rx.recv() {
-                    match packet {
-                        BlockCompressorMessage::CompressBlockAndWrite {
-                            block_data,
-                            num_docs_in_block,
-                        } => {
-                            block_compressor
-                                .compress_block_and_write(&block_data[..], num_docs_in_block)?;
-                        }
-                        BlockCompressorMessage::Stack(store_reader) => {
-                            block_compressor.stack(store_reader)?;
-                        }
+            async_channel::Sender<BlockCompressorMessage>,
+            async_channel::Receiver<BlockCompressorMessage>,
+        ) = async_channel::bounded(3);
+        let join_handle = TOKIO_DOCSTORE_COMPRESS_RUNTIME.spawn(async move {
+            while let Ok(packet) = rx.recv().await {
+                match packet {
+                    BlockCompressorMessage::CompressBlockAndWrite {
+                        block_data,
+                        num_docs_in_block,
+                    } => {
+                        block_compressor
+                            .compress_block_and_write(&block_data[..], num_docs_in_block)?;
+                    }
+                    BlockCompressorMessage::Stack(store_reader) => {
+                        block_compressor.stack(store_reader)?;
                     }
                 }
-                block_compressor.close()?;
-                Ok(())
-            })?;
+            }
+            block_compressor.close()?;
+            Ok(())
+        });
+
         Ok(DedicatedThreadBlockCompressorImpl {
             join_handle: Some(join_handle),
-            tx,
+            tx: Arc::new(tx),
         })
     }
 
-    fn compress_block_and_write(&mut self, bytes: &[u8], num_docs_in_block: u32) -> io::Result<()> {
+    async fn schedule_compress_block_and_write(
+        &mut self,
+        bytes: &[u8],
+        num_docs_in_block: u32,
+    ) -> io::Result<()> {
         self.send(BlockCompressorMessage::CompressBlockAndWrite {
             block_data: bytes.to_vec(),
             num_docs_in_block,
         })
+        .await
     }
 
-    fn stack_reader(&mut self, store_reader: StoreReader) -> io::Result<()> {
-        self.send(BlockCompressorMessage::Stack(store_reader))
+    async fn stack_reader(&mut self, store_reader: StoreReader) -> io::Result<()> {
+        self.send(BlockCompressorMessage::Stack(store_reader)).await
     }
 
-    fn send(&mut self, msg: BlockCompressorMessage) -> io::Result<()> {
-        if self.tx.send(msg).is_err() {
-            harvest_thread_result(self.join_handle.take())?;
+    async fn send(&mut self, msg: BlockCompressorMessage) -> io::Result<()> {
+        if self.tx.send(msg).await.is_err() {
+            harvest_thread_result(self.join_handle.take()).await?;
             return Err(io::Error::new(io::ErrorKind::Other, "Unidentified error."));
         }
         Ok(())
     }
 
-    fn close(self) -> io::Result<()> {
+    async fn close(self) -> io::Result<()> {
         drop(self.tx);
-        harvest_thread_result(self.join_handle)
+        harvest_thread_result(self.join_handle).await
     }
 }
 
@@ -230,11 +238,13 @@ impl DedicatedThreadBlockCompressorImpl {
 ///
 /// If the thread panicked, or if the result has already been harvested,
 /// returns an explicit error.
-fn harvest_thread_result(join_handle_opt: Option<JoinHandle<io::Result<()>>>) -> io::Result<()> {
+async fn harvest_thread_result(
+    join_handle_opt: Option<JoinHandle<io::Result<()>>>,
+) -> io::Result<()> {
     let join_handle = join_handle_opt
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Thread already joined."))?;
     join_handle
-        .join()
+        .await
         .map_err(|_err| io::Error::new(io::ErrorKind::Other, "Compressing thread panicked."))?
 }
 
@@ -248,15 +258,19 @@ mod tests {
     use crate::store::Compressor;
     use crate::Directory;
 
-    fn populate_block_compressor(mut block_compressor: BlockCompressor) -> io::Result<()> {
-        block_compressor.compress_block_and_write(b"hello", 1)?;
-        block_compressor.compress_block_and_write(b"happy", 1)?;
-        block_compressor.close()?;
+    async fn populate_block_compressor(mut block_compressor: BlockCompressor) -> io::Result<()> {
+        block_compressor
+            .compress_block_and_write(b"hello", 1)
+            .await?;
+        block_compressor
+            .compress_block_and_write(b"happy", 1)
+            .await?;
+        block_compressor.close().await?;
         Ok(())
     }
 
-    #[test]
-    fn test_block_store_compressor_impls_yield_the_same_result() {
+    #[tokio::test]
+    async fn test_block_store_compressor_impls_yield_the_same_result() {
         let ram_directory = RamDirectory::default();
         let path1 = Path::new("path1");
         let path2 = Path::new("path2");
@@ -264,8 +278,8 @@ mod tests {
         let wrt2 = ram_directory.open_write(path2).unwrap();
         let block_compressor1 = BlockCompressor::new(Compressor::None, wrt1, true).unwrap();
         let block_compressor2 = BlockCompressor::new(Compressor::None, wrt2, false).unwrap();
-        populate_block_compressor(block_compressor1).unwrap();
-        populate_block_compressor(block_compressor2).unwrap();
+        populate_block_compressor(block_compressor1).await.unwrap();
+        populate_block_compressor(block_compressor2).await.unwrap();
         let data1 = ram_directory.open_read(path1).unwrap();
         let data2 = ram_directory.open_read(path2).unwrap();
         assert_eq!(data1.read_bytes().unwrap(), data2.read_bytes().unwrap());

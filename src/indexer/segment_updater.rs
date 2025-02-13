@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
-use rayon::{ThreadPool, ThreadPoolBuilder};
+use rayon::ThreadPool;
 
 use super::pool;
 use super::segment_manager::SegmentManager;
@@ -18,6 +18,7 @@ use crate::indexer::delete_queue::DeleteCursor;
 use crate::indexer::index_writer::advance_deletes;
 use crate::indexer::merge_operation::MergeOperationInventory;
 use crate::indexer::merger::IndexMerger;
+use crate::indexer::pool::TOKIO_MERGER_THREAD_POOL;
 use crate::indexer::segment_manager::SegmentsStatus;
 use crate::indexer::stamper::Stamper;
 use crate::indexer::{
@@ -82,7 +83,7 @@ fn garbage_collect_files(
 
 /// Merges a list of segments the list of segment givens in the `segment_entries`.
 /// This function happens in the calling thread and is computationally expensive.
-fn merge(
+async fn merge(
     index: &Index,
     mut segment_entries: Vec<SegmentEntry>,
     target_opstamp: Opstamp,
@@ -117,7 +118,7 @@ fn merge(
     // ... we just serialize this index merger in our new segment to merge the segments.
     let segment_serializer = SegmentSerializer::for_segment(merged_segment.clone())?;
 
-    let num_docs = merger.write(segment_serializer)?;
+    let num_docs = merger.write(segment_serializer).await?;
 
     let merged_segment_id = merged_segment.id();
 
@@ -137,7 +138,7 @@ fn merge(
 /// meant to work if you have an `IndexWriter` running for the origin indices, or
 /// the destination `Index`.
 #[doc(hidden)]
-pub fn merge_indices<T: Into<Box<dyn Directory>>>(
+pub async fn merge_indices<T: Into<Box<dyn Directory>>>(
     indices: &[Index],
     output_directory: T,
 ) -> crate::Result<Index> {
@@ -167,7 +168,7 @@ pub fn merge_indices<T: Into<Box<dyn Directory>>>(
     }
 
     let non_filter = segments.iter().map(|_| None).collect::<Vec<_>>();
-    merge_filtered_segments(&segments, target_settings, non_filter, output_directory)
+    merge_filtered_segments(&segments, target_settings, non_filter, output_directory).await
 }
 
 /// Advanced: Merges a list of segments from different indices in a new index.
@@ -183,7 +184,7 @@ pub fn merge_indices<T: Into<Box<dyn Directory>>>(
 /// meant to work if you have an `IndexWriter` running for the origin indices, or
 /// the destination `Index`.
 #[doc(hidden)]
-pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
+pub async fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
     segments: &[Segment],
     target_settings: IndexSettings,
     filter_doc_ids: Vec<Option<AliveBitSet>>,
@@ -219,7 +220,7 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
     let merger: IndexMerger =
         IndexMerger::open_with_custom_alive_set(merged_index.schema(), segments, filter_doc_ids)?;
     let segment_serializer = SegmentSerializer::for_segment(merged_segment)?;
-    let num_docs = merger.write(segment_serializer)?;
+    let num_docs = merger.write(segment_serializer).await?;
 
     let segment_meta = merged_index.new_segment_meta(merged_segment_id, num_docs);
 
@@ -257,7 +258,6 @@ pub(crate) struct InnerSegmentUpdater {
     // the unique active `SegmentUpdater`.
     active_index_meta: RwLock<Arc<IndexMeta>>,
     pool: &'static ThreadPool,
-    merge_thread_pool: &'static ThreadPool,
 
     index: Index,
     segment_manager: SegmentManager,
@@ -272,7 +272,7 @@ impl SegmentUpdater {
         index: Index,
         stamper: Stamper,
         delete_cursor: &DeleteCursor,
-        num_merge_threads: usize,
+        _num_merge_threads: usize,
     ) -> crate::Result<SegmentUpdater> {
         let segments = index.searchable_segment_metas()?;
         let segment_manager = SegmentManager::from_segments(segments, delete_cursor);
@@ -280,7 +280,6 @@ impl SegmentUpdater {
         Ok(SegmentUpdater(Arc::new(InnerSegmentUpdater {
             active_index_meta: RwLock::new(Arc::new(index_meta)),
             pool: &pool::WRITER_THREAD_POOL,
-            merge_thread_pool: &pool::MERGER_THREAD_POOL,
             index,
             segment_manager,
             merge_policy: RwLock::new(Arc::new(DefaultMergePolicy::default())),
@@ -484,7 +483,7 @@ impl SegmentUpdater {
         let (scheduled_result, merging_future_send) =
             FutureResult::create("Merge operation failed.");
 
-        self.merge_thread_pool.spawn(move || {
+        TOKIO_MERGER_THREAD_POOL.spawn(async move {
             // The fact that `merge_operation` is moved here is important.
             // Its lifetime is used to track how many merging thread are currently running,
             // as well as which segment is currently in merge and therefore should not be
@@ -493,7 +492,9 @@ impl SegmentUpdater {
                 &segment_updater.index,
                 segment_entries,
                 merge_operation.target_opstamp(),
-            ) {
+            )
+            .await
+            {
                 Ok(after_merge_segment_entry) => {
                     let res = segment_updater.end_merge(merge_operation, after_merge_segment_entry);
                     let _send_result = merging_future_send.send(res);
@@ -824,6 +825,7 @@ mod tests {
 
     #[test]
     fn test_merge_segments() -> crate::Result<()> {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
         let mut indices = vec![];
         let mut schema_builder = Schema::builder();
         let text_field = schema_builder.add_text_field("text", TEXT);
@@ -850,7 +852,8 @@ mod tests {
 
         assert_eq!(indices.len(), 3);
         let output_directory: Box<dyn Directory> = Box::<RamDirectory>::default();
-        let index = merge_indices(&indices, output_directory)?;
+        let index =
+            runtime.block_on(async move { merge_indices(&indices, output_directory).await })?;
         assert_eq!(index.schema(), schema);
 
         let segments = index.searchable_segments()?;
@@ -864,7 +867,9 @@ mod tests {
 
     #[test]
     fn test_merge_empty_indices_array() {
-        let merge_result = merge_indices(&[], RamDirectory::default());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let merge_result =
+            runtime.block_on(async move { merge_indices(&[], RamDirectory::default()).await });
         assert!(merge_result.is_err());
     }
 
@@ -890,8 +895,11 @@ mod tests {
             index
         };
 
+        let runtime = tokio::runtime::Runtime::new().unwrap();
         // mismatched schema index list
-        let result = merge_indices(&[first_index, second_index], RamDirectory::default());
+        let result = runtime.block_on(async move {
+            merge_indices(&[first_index, second_index], RamDirectory::default()).await
+        });
         assert!(result.is_err());
 
         Ok(())
@@ -934,12 +942,16 @@ mod tests {
 
         let filter_segments = vec![Some(filter_segment_1), Some(filter_segment_2)];
 
-        let merged_index = merge_filtered_segments(
-            &segments,
-            target_settings,
-            filter_segments,
-            RamDirectory::default(),
-        )?;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let merged_index = runtime.block_on(async move {
+            merge_filtered_segments(
+                &segments,
+                target_settings,
+                filter_segments,
+                RamDirectory::default(),
+            )
+            .await
+        })?;
 
         let segments = merged_index.searchable_segments()?;
         assert_eq!(segments.len(), 1);
@@ -979,12 +991,16 @@ mod tests {
 
         let filter_segments = vec![Some(filter_segment)];
 
-        let index = merge_filtered_segments(
-            &segments,
-            target_settings,
-            filter_segments,
-            RamDirectory::default(),
-        )?;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let index = runtime.block_on(async move {
+            merge_filtered_segments(
+                &segments,
+                target_settings,
+                filter_segments,
+                RamDirectory::default(),
+            )
+            .await
+        })?;
 
         let segments = index.searchable_segments()?;
         assert_eq!(segments.len(), 1);

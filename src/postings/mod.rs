@@ -216,8 +216,8 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    #[test]
-    pub fn test_position_and_fieldnorm1() -> crate::Result<()> {
+    #[tokio::test]
+    pub async fn test_position_and_fieldnorm1() -> crate::Result<()> {
         let mut positions = Vec::new();
         let mut schema_builder = Schema::builder();
         let text_field = schema_builder.add_text_field("text", TEXT);
@@ -237,14 +237,14 @@ pub(crate) mod tests {
                        text_field => "d d d d a"
                     ),
                 };
-                segment_writer.add_document(op)?;
+                segment_writer.add_document(op).await?;
             }
             {
                 let op = AddOperation {
                     opstamp: 1u64,
                     document: doc!(text_field => "b a"),
                 };
-                segment_writer.add_document(op).unwrap();
+                segment_writer.add_document(op).await.unwrap();
             }
             for i in 2..1000 {
                 let mut text: String = "e ".repeat(i);
@@ -253,9 +253,9 @@ pub(crate) mod tests {
                     opstamp: 2u64,
                     document: doc!(text_field => text),
                 };
-                segment_writer.add_document(op).unwrap();
+                segment_writer.add_document(op).await.unwrap();
             }
-            segment_writer.finalize()?;
+            segment_writer.finalize().await?;
         }
         {
             let segment_reader = SegmentReader::open(&segment)?;

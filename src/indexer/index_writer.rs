@@ -1,7 +1,5 @@
 use std::ops::Range;
 use std::sync::Arc;
-use std::thread;
-use std::thread::JoinHandle;
 
 use common::BitSet;
 use smallvec::{smallvec, SmallVec};
@@ -40,7 +38,7 @@ pub const MAX_NUM_THREAD: usize = 8;
 // reaches `PIPELINE_MAX_SIZE_IN_DOCS`
 const PIPELINE_MAX_SIZE_IN_DOCS: usize = 10_000;
 
-fn error_in_index_worker_thread(context: &str) -> TantivyError {
+pub(crate) fn error_in_index_worker_thread(context: &str) -> TantivyError {
     TantivyError::ErrorInThread(format!(
         "{context}. A worker thread encountered an error (io::Error most likely) or panicked."
     ))
@@ -190,12 +188,12 @@ async fn index_documents<D: Document>(
 ) -> crate::Result<()> {
     let mut segment_writer = SegmentWriter::for_segment(memory_budget, segment.clone())?;
     for doc in first_batch {
-        segment_writer.add_document(doc)?;
+        segment_writer.add_document(doc).await?;
     }
     loop {
         if let Ok(document_group) = receiver.recv().await {
             for doc in document_group {
-                segment_writer.add_document(doc)?;
+                segment_writer.add_document(doc).await?;
             }
             let mem_usage = segment_writer.mem_usage();
             if mem_usage >= memory_budget - MARGIN_IN_BYTES {
@@ -220,7 +218,7 @@ async fn index_documents<D: Document>(
     // the worker thread.
     assert!(max_doc > 0);
 
-    let doc_opstamps: Vec<Opstamp> = segment_writer.finalize()?;
+    let doc_opstamps: Vec<Opstamp> = segment_writer.finalize().await?;
 
     let segment_with_max_doc = segment.with_max_doc(max_doc);
 

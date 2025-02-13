@@ -486,7 +486,7 @@ impl IndexMerger {
         Ok(())
     }
 
-    fn write_storable_fields(&self, store_writer: &mut StoreWriter) -> crate::Result<()> {
+    async fn write_storable_fields(&self, store_writer: &mut StoreWriter) -> crate::Result<()> {
         debug_time!("write-storable-fields");
         debug!("write-storable-field");
 
@@ -511,10 +511,10 @@ impl IndexMerger {
             {
                 for doc_bytes_res in store_reader.iter_raw(reader.alive_bitset()) {
                     let doc_bytes = doc_bytes_res?;
-                    store_writer.store_bytes(&doc_bytes)?;
+                    store_writer.store_bytes(&doc_bytes).await?;
                 }
             } else {
-                store_writer.stack(store_reader)?;
+                store_writer.stack(store_reader).await?;
             }
         }
         Ok(())
@@ -525,7 +525,7 @@ impl IndexMerger {
     ///
     /// # Returns
     /// The number of documents in the resulting segment.
-    pub fn write(&self, mut serializer: SegmentSerializer) -> crate::Result<u32> {
+    pub async fn write(&self, mut serializer: SegmentSerializer) -> crate::Result<u32> {
         let doc_id_mapping = self.get_doc_id_from_concatenated_data()?;
         debug!("write-fieldnorms");
         if let Some(fieldnorms_serializer) = serializer.extract_fieldnorms_serializer() {
@@ -543,12 +543,13 @@ impl IndexMerger {
         )?;
 
         debug!("write-storagefields");
-        self.write_storable_fields(serializer.get_store_writer())?;
+        self.write_storable_fields(serializer.get_store_writer())
+            .await?;
         debug!("write-fastfields");
         self.write_fast_fields(serializer.get_fast_field_write(), doc_id_mapping)?;
 
         debug!("close-serializer");
-        serializer.close()?;
+        serializer.close().await?;
         Ok(self.max_doc)
     }
 }

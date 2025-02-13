@@ -75,7 +75,7 @@ pub(crate) mod tests {
 
     const BLOCK_SIZE: usize = 16_384;
 
-    pub fn write_lorem_ipsum_store(
+    pub async fn write_lorem_ipsum_store(
         writer: WritePtr,
         num_docs: usize,
         compressor: Compressor,
@@ -94,16 +94,16 @@ pub(crate) mod tests {
                 let mut doc = TantivyDocument::default();
                 doc.add_text(field_body, LOREM);
                 doc.add_text(field_title, format!("Doc {i}"));
-                store_writer.store(&doc, &schema).unwrap();
+                store_writer.store(&doc, &schema).await.unwrap();
             }
-            store_writer.close().unwrap();
+            store_writer.close().await.unwrap();
         }
         schema
     }
 
     const NUM_DOCS: usize = 1_000;
-    #[test]
-    fn test_doc_store_iter_with_delete_bug_1077() -> crate::Result<()> {
+    #[tokio::test]
+    async fn test_doc_store_iter_with_delete_bug_1077() -> crate::Result<()> {
         // this will cover deletion of the first element in a checkpoint
         let deleted_doc_ids = (200..300).collect::<Vec<_>>();
         let alive_bitset =
@@ -113,7 +113,7 @@ pub(crate) mod tests {
         let directory = RamDirectory::create();
         let store_wrt = directory.open_write(path)?;
         let schema =
-            write_lorem_ipsum_store(store_wrt, NUM_DOCS, Compressor::Lz4, BLOCK_SIZE, true);
+            write_lorem_ipsum_store(store_wrt, NUM_DOCS, Compressor::Lz4, BLOCK_SIZE, true).await;
         let field_title = schema.get_field("title").unwrap();
         let store_file = directory.open_read(path)?;
         let store = StoreReader::open(store_file, 10)?;
@@ -156,7 +156,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    fn test_store(
+    async fn test_store(
         compressor: Compressor,
         blocksize: usize,
         separate_thread: bool,
@@ -165,7 +165,8 @@ pub(crate) mod tests {
         let directory = RamDirectory::create();
         let store_wrt = directory.open_write(path)?;
         let schema =
-            write_lorem_ipsum_store(store_wrt, NUM_DOCS, compressor, blocksize, separate_thread);
+            write_lorem_ipsum_store(store_wrt, NUM_DOCS, compressor, blocksize, separate_thread)
+                .await;
         let field_title = schema.get_field("title").unwrap();
         let store_file = directory.open_read(path)?;
         let store = StoreReader::open(store_file, 10)?;
@@ -189,30 +190,31 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_store_no_compression_same_thread() -> crate::Result<()> {
-        test_store(Compressor::None, BLOCK_SIZE, false)
+    #[tokio::test]
+    async fn test_store_no_compression_same_thread() -> crate::Result<()> {
+        test_store(Compressor::None, BLOCK_SIZE, false).await
     }
 
-    #[test]
-    fn test_store_no_compression() -> crate::Result<()> {
-        test_store(Compressor::None, BLOCK_SIZE, true)
+    #[tokio::test]
+    async fn test_store_no_compression() -> crate::Result<()> {
+        test_store(Compressor::None, BLOCK_SIZE, true).await
     }
 
     #[cfg(feature = "lz4-compression")]
-    #[test]
-    fn test_store_lz4_block() -> crate::Result<()> {
-        test_store(Compressor::Lz4, BLOCK_SIZE, true)
+    #[tokio::test]
+    async fn test_store_lz4_block() -> crate::Result<()> {
+        test_store(Compressor::Lz4, BLOCK_SIZE, true).await
     }
 
     #[cfg(feature = "zstd-compression")]
-    #[test]
-    fn test_store_zstd() -> crate::Result<()> {
+    #[tokio::test]
+    async fn test_store_zstd() -> crate::Result<()> {
         test_store(
             Compressor::Zstd(ZstdCompressor::default()),
             BLOCK_SIZE,
             true,
         )
+        .await
     }
 
     #[test]

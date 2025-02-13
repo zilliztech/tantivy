@@ -77,13 +77,13 @@ impl SegmentSerializer {
     }
 
     /// Finalize the segment serialization.
-    pub fn close(mut self) -> crate::Result<()> {
+    pub async fn close(mut self) -> crate::Result<()> {
         if let Some(fieldnorms_serializer) = self.extract_fieldnorms_serializer() {
             fieldnorms_serializer.close()?;
         }
         self.fast_field_write.terminate()?;
         self.postings_serializer.close()?;
-        self.store_writer.close()?;
+        self.store_writer.close().await?;
         Ok(())
     }
 }

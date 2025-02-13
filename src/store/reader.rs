@@ -458,12 +458,13 @@ mod tests {
         assert!(DocStoreVersion::V1 < DocStoreVersion::V2);
     }
 
-    #[test]
-    fn test_store_lru_cache() -> crate::Result<()> {
+    #[tokio::test]
+    async fn test_store_lru_cache() -> crate::Result<()> {
         let directory = RamDirectory::create();
         let path = Path::new("store");
         let writer = directory.open_write(path)?;
-        let schema = write_lorem_ipsum_store(writer, 500, Compressor::default(), BLOCK_SIZE, true);
+        let schema =
+            write_lorem_ipsum_store(writer, 500, Compressor::default(), BLOCK_SIZE, true).await;
         let title = schema.get_field("title").unwrap();
         let store_file = directory.open_read(path)?;
         let store = StoreReader::open(store_file, DOCSTORE_CACHE_CAPACITY)?;

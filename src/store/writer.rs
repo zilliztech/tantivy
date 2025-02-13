@@ -58,18 +58,18 @@ impl StoreWriter {
     }
 
     /// Checks if the current block is full, and if so, compresses and flushes it.
-    fn check_flush_block(&mut self) -> io::Result<()> {
+    async fn check_flush_block(&mut self) -> io::Result<()> {
         // this does not count the VInt storing the index length itself, but it is negligible in
         // front of everything else.
         let index_len = self.doc_pos.len() * std::mem::size_of::<usize>();
         if self.current_block.len() + index_len > self.block_size {
-            self.send_current_block_to_compressor()?;
+            self.send_current_block_to_compressor().await?;
         }
         Ok(())
     }
 
     /// Flushes current uncompressed block and sends to compressor.
-    fn send_current_block_to_compressor(&mut self) -> io::Result<()> {
+    async fn send_current_block_to_compressor(&mut self) -> io::Result<()> {
         // We don't do anything if the current block is empty to begin with.
         if self.current_block.is_empty() {
             return Ok(());
@@ -85,7 +85,8 @@ impl StoreWriter {
         (self.doc_pos.len() as u32).serialize(&mut self.current_block)?;
 
         self.block_compressor
-            .compress_block_and_write(&self.current_block, self.num_docs_in_current_block)?;
+            .compress_block_and_write(&self.current_block, self.num_docs_in_current_block)
+            .await?;
         self.doc_pos.clear();
         self.current_block.clear();
         self.num_docs_in_current_block = 0;
@@ -96,14 +97,14 @@ impl StoreWriter {
     ///
     /// The document id is implicitly the current number
     /// of documents.
-    pub fn store<D: Document>(&mut self, document: &D, schema: &Schema) -> io::Result<()> {
+    pub async fn store<D: Document>(&mut self, document: &D, schema: &Schema) -> io::Result<()> {
         self.doc_pos.push(self.current_block.len() as u32);
 
         let mut serializer = BinaryDocumentSerializer::new(&mut self.current_block, schema);
         serializer.serialize_doc(document)?;
 
         self.num_docs_in_current_block += 1;
-        self.check_flush_block()?;
+        self.check_flush_block().await?;
         Ok(())
     }
 
@@ -111,11 +112,11 @@ impl StoreWriter {
     ///
     /// The document id is implicitly the current number
     /// of documents.
-    pub fn store_bytes(&mut self, serialized_document: &[u8]) -> io::Result<()> {
+    pub async fn store_bytes(&mut self, serialized_document: &[u8]) -> io::Result<()> {
         self.doc_pos.push(self.current_block.len() as u32);
         self.current_block.extend_from_slice(serialized_document);
         self.num_docs_in_current_block += 1;
-        self.check_flush_block()?;
+        self.check_flush_block().await?;
         Ok(())
     }
 
@@ -123,10 +124,10 @@ impl StoreWriter {
     /// This method is an optimization compared to iterating over the documents
     /// in the store and adding them one by one, as the store's data will
     /// not be decompressed and then recompressed.
-    pub fn stack(&mut self, store_reader: StoreReader) -> io::Result<()> {
+    pub async fn stack(&mut self, store_reader: StoreReader) -> io::Result<()> {
         // We flush the current block first before stacking
-        self.send_current_block_to_compressor()?;
-        self.block_compressor.stack_reader(store_reader)?;
+        self.send_current_block_to_compressor().await?;
+        self.block_compressor.stack_reader(store_reader).await?;
         Ok(())
     }
 
@@ -134,9 +135,9 @@ impl StoreWriter {
     ///
     /// Compress the last unfinished block if any,
     /// and serializes the skip list index on disc.
-    pub fn close(mut self) -> io::Result<()> {
-        self.send_current_block_to_compressor()?;
-        self.block_compressor.close()?;
+    pub async fn close(mut self) -> io::Result<()> {
+        self.send_current_block_to_compressor().await?;
+        self.block_compressor.close().await?;
         Ok(())
     }
 }
