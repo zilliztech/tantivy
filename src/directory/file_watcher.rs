@@ -88,11 +88,15 @@ impl FileWatcher {
 
         Ok(hasher.finalize())
     }
+
+    pub fn graceful_stop(&self) {
+        self.state.store(2, Ordering::SeqCst);
+    }
 }
 
 impl Drop for FileWatcher {
     fn drop(&mut self) {
-        self.state.store(2, Ordering::SeqCst);
+        self.graceful_stop();
     }
 }
 

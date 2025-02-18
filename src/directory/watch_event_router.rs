@@ -26,6 +26,12 @@ pub struct WatchCallbackList {
     router: RwLock<Vec<Weak<WatchCallback>>>,
 }
 
+impl WatchCallbackList {
+    pub fn clear(&self) {
+        self.router.write().unwrap().clear();
+    }
+}
+
 /// Controls how long a directory should watch for a file change.
 ///
 /// After all the clones of `WatchHandle` are dropped, the associated will not be called when a
