@@ -357,7 +357,7 @@ impl<D: Document> IndexWriter<D> {
         }
 
         if singleton_options.singleton_tokio_docstore_worker_threads == 0 {
-            let err_msg = "singleton_tokio_doccstore_worker_threads is 0".to_string();
+            let err_msg = "singleton_tokio_docstore_worker_threads is 0".to_string();
             return Err(TantivyError::InvalidArgument(err_msg));
         }
 
