@@ -223,6 +223,11 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
     /// `OnCommitWithDelay` `ReloadPolicy`. Not implementing watch in a `Directory` only prevents
     /// the `OnCommitWithDelay` `ReloadPolicy` to work properly.
     fn watch(&self, watch_callback: WatchCallback) -> crate::Result<WatchHandle>;
+
+    /// Stops the watcher and clears all registered callbacks.
+    /// The behavior of subsequent calls to `watch()` depends on the specific Directory
+    /// implementation.
+    fn unwatch_callbacks(&self);
 }
 
 /// DirectoryClone

@@ -302,3 +302,11 @@ impl IndexReader {
         self.inner.searcher()
     }
 }
+
+impl Drop for IndexReader {
+    fn drop(&mut self) {
+        // For mmap directory, unwatch_callbacks() will block until running callbacks are finished
+        // to ensure no lock file will be created after the index reader is dropped.
+        self.inner.index.directory().unwatch_callbacks();
+    }
+}

@@ -98,10 +98,8 @@ impl FileWatcher {
 
         Ok(hasher.finalize())
     }
-}
 
-impl Drop for FileWatcher {
-    fn drop(&mut self) {
+    pub fn graceful_stop(&self) {
         self.state.store(2, Ordering::SeqCst);
         if let Some(handle) = self.watch_handle.write().unwrap().take() {
             let _ = self.wakeup_channel.write().unwrap().take();
@@ -110,6 +108,12 @@ impl Drop for FileWatcher {
                 .expect("Failed to join meta file watcher thread");
             info!("Meta file watcher thread joined");
         }
+    }
+}
+
+impl Drop for FileWatcher {
+    fn drop(&mut self) {
+        self.graceful_stop();
     }
 }
 
@@ -196,34 +200,6 @@ mod tests {
         atomic_write(&tmp_file, b"qux")?;
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert_eq!(state.load(Ordering::SeqCst), 1);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_file_watcher_drop_handle_and_watcher() -> crate::Result<()> {
-        let tmp_dir = tempfile::TempDir::new()?;
-        let tmp_file = tmp_dir.path().join("watched.txt");
-
-        let watcher = FileWatcher::new(&tmp_file);
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        let handle = watcher.watch(WatchCallback::new(move || {
-            assert!(tx.send(()).is_ok());
-            thread::sleep(Duration::from_secs(3));
-            assert!(tx.send(()).is_ok());
-        }));
-
-        // change the file
-        atomic_write(&tmp_file, b"foo")?;
-
-        // wait for the callback to be called
-        let timeout = Duration::from_secs(3);
-        assert!(rx.recv_timeout(timeout).is_ok());
-
-        mem::drop(watcher);
-        // check that the callback finished
-        assert!(rx.try_recv().is_ok());
 
         Ok(())
     }

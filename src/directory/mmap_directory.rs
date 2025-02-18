@@ -498,6 +498,10 @@ impl Directory for MmapDirectory {
         Ok(self.inner.watch(watch_callback))
     }
 
+    fn unwatch_callbacks(&self) {
+        self.inner.watcher.graceful_stop();
+    }
+
     #[cfg(windows)]
     fn sync_directory(&self) -> Result<(), io::Error> {
         // On Windows, it is not necessary to fsync the parent directory to

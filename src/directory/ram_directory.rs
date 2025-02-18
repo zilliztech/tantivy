@@ -234,6 +234,10 @@ impl Directory for RamDirectory {
         Ok(self.fs.write().unwrap().watch(watch_callback))
     }
 
+    fn unwatch_callbacks(&self) {
+        self.fs.write().unwrap().watch_router.clear();
+    }
+
     fn sync_directory(&self) -> io::Result<()> {
         Ok(())
     }
