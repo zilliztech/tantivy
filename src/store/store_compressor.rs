@@ -7,7 +7,7 @@ use tokio::task::JoinHandle;
 
 use super::DOC_STORE_VERSION;
 use crate::directory::WritePtr;
-use crate::indexer::TOKIO_DOCSTORE_COMPRESS_RUNTIME;
+use crate::indexer::get_tokio_docstore_compress_worker_pool;
 use crate::store::footer::DocStoreFooter;
 use crate::store::index::{Checkpoint, SkipIndexBuilder};
 use crate::store::{Compressor, Decompressor, StoreReader};
@@ -179,7 +179,7 @@ impl DedicatedThreadBlockCompressorImpl {
             async_channel::Sender<BlockCompressorMessage>,
             async_channel::Receiver<BlockCompressorMessage>,
         ) = async_channel::bounded(3);
-        let join_handle = TOKIO_DOCSTORE_COMPRESS_RUNTIME.spawn(async move {
+        let join_handle = get_tokio_docstore_compress_worker_pool().spawn(async move {
             while let Ok(packet) = rx.recv().await {
                 match packet {
                     BlockCompressorMessage::CompressBlockAndWrite {

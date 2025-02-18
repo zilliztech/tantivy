@@ -1,11 +1,12 @@
 use std::ops::Range;
 use std::sync::Arc;
+use std::thread;
 
 use common::BitSet;
 use smallvec::{smallvec, SmallVec};
 
 use super::operation::{AddOperation, UserOperation};
-use super::pool::TOKIO_RUNTIME;
+use super::pool::{get_tokio_indexing_worker_pool, init_pool};
 use super::segment_updater::SegmentUpdater;
 use super::{AddBatch, AddBatchReceiver, AddBatchSender, PreparedCommit};
 use crate::directory::{DirectoryLock, GarbageCollectionResult, TerminatingWrite};
@@ -54,11 +55,39 @@ pub struct IndexWriterOptions {
     /// it will flush the segment to disk (although this is not searchable until commit is called.)
     memory_budget_per_thread: usize,
     #[builder(default = 1)]
-    /// The number of indexer worker threads to use.
-    num_worker_threads: usize,
+    /// The number of indexer workers to use.
+    num_indexing_worker: usize,
     #[builder(default = 4)]
-    /// Defines the number of merger threads to use.
-    num_merge_threads: usize,
+    /// Defines the number of merger workers to use.
+    // todo(SpadeA): we should use this to limit the running merge operations
+    _num_merge_worker: usize,
+}
+
+#[derive(Clone, bon::Builder)]
+/// A builder for creating a new [IndexWriter] for an index.
+pub struct SingletonIndexWriterOptions {
+    /// Singltone tokio runtime thread number for indexing worker.
+    pub singleton_tokio_indexing_worker_threads: usize,
+    /// Singltone tokio runtime thread number for merge worker.
+    pub singleton_tokio_merge_worker_threads: usize,
+    /// Singltone tokio runtime thread number for docstore compresser.
+    pub singleton_tokio_docstore_worker_threads: usize,
+    /// Singltone thread pool thread number for segment updater.
+    pub singleton_segment_updater_worker_threads: usize,
+}
+
+impl Default for SingletonIndexWriterOptions {
+    fn default() -> Self {
+        let cpu_cores = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        Self {
+            singleton_tokio_indexing_worker_threads: cpu_cores,
+            singleton_tokio_merge_worker_threads: cpu_cores,
+            singleton_tokio_docstore_worker_threads: cpu_cores,
+            singleton_segment_updater_worker_threads: cpu_cores,
+        }
+    }
 }
 
 /// `IndexWriter` is the user entry-point to add document to an index.
@@ -75,6 +104,7 @@ pub struct IndexWriter<D: Document = TantivyDocument> {
     index: Index,
 
     options: IndexWriterOptions,
+    singleton_options: SingletonIndexWriterOptions,
 
     workers_join_handle: Vec<tokio::task::JoinHandle<Result<(), TantivyError>>>,
 
@@ -287,6 +317,7 @@ impl<D: Document> IndexWriter<D> {
     pub(crate) fn new(
         index: &Index,
         options: IndexWriterOptions,
+        singleton_options: SingletonIndexWriterOptions,
         directory_lock: DirectoryLock,
     ) -> crate::Result<Self> {
         if options.memory_budget_per_thread < MEMORY_BUDGET_NUM_BYTES_MIN {
@@ -302,10 +333,41 @@ impl<D: Document> IndexWriter<D> {
             );
             return Err(TantivyError::InvalidArgument(err_msg));
         }
-        if options.num_worker_threads == 0 {
+        if options.num_indexing_worker == 0 {
             let err_msg = "At least one worker thread is required, got 0".to_string();
             return Err(TantivyError::InvalidArgument(err_msg));
         }
+
+        if singleton_options.singleton_tokio_indexing_worker_threads == 0
+            || singleton_options.singleton_tokio_indexing_worker_threads
+                < options.num_indexing_worker
+        {
+            let err_msg = format!(
+                "singleton_tokio_indexing_worker_threads is 0 or less than num_indexing_worker, 
+                singleton_tokio_indexing_worker_threads {}, num_indexing_worker {}",
+                singleton_options.singleton_tokio_indexing_worker_threads,
+                options.num_indexing_worker
+            );
+            return Err(TantivyError::InvalidArgument(err_msg));
+        }
+
+        if singleton_options.singleton_tokio_merge_worker_threads == 0 {
+            let err_msg = "singleton_tokio_merge_worker_threads is 0".to_string();
+            return Err(TantivyError::InvalidArgument(err_msg));
+        }
+
+        if singleton_options.singleton_tokio_docstore_worker_threads == 0 {
+            let err_msg = "singleton_tokio_doccstore_worker_threads is 0".to_string();
+            return Err(TantivyError::InvalidArgument(err_msg));
+        }
+
+        if singleton_options.singleton_segment_updater_worker_threads == 0 {
+            let err_msg = "singleton_segment_updater_worker_threads is 0".to_string();
+            return Err(TantivyError::InvalidArgument(err_msg));
+        }
+
+        // Init thread pools
+        init_pool(singleton_options.clone());
 
         let (document_sender, document_receiver): (AddBatchSender<D>, AddBatchReceiver<D>) =
             async_channel::bounded(PIPELINE_MAX_SIZE_IN_DOCS);
@@ -316,17 +378,14 @@ impl<D: Document> IndexWriter<D> {
 
         let stamper = Stamper::new(current_opstamp);
 
-        let segment_updater = SegmentUpdater::create(
-            index.clone(),
-            stamper.clone(),
-            &delete_queue.cursor(),
-            options.num_merge_threads,
-        )?;
+        let segment_updater =
+            SegmentUpdater::create(index.clone(), stamper.clone(), &delete_queue.cursor())?;
 
         let mut index_writer = Self {
             _directory_lock: Some(directory_lock),
 
             options: options.clone(),
+            singleton_options,
             index: index.clone(),
             index_writer_status: IndexWriterStatus::from(document_receiver),
             operation_sender: Arc::new(document_sender),
@@ -365,7 +424,7 @@ impl<D: Document> IndexWriter<D> {
 
         let former_workers_handles = std::mem::take(&mut self.workers_join_handle);
         for join_handle in former_workers_handles {
-            TOKIO_RUNTIME
+            get_tokio_indexing_worker_pool()
                 .block_on(join_handle)
                 .map_err(|_| error_in_index_worker_thread("Worker thread panicked."))?
                 .map_err(|_| error_in_index_worker_thread("Worker thread failed."))?;
@@ -429,7 +488,7 @@ impl<D: Document> IndexWriter<D> {
         let mem_budget = self.options.memory_budget_per_thread;
         let index = self.index.clone();
 
-        let join_handle = TOKIO_RUNTIME.spawn(async move {
+        let join_handle = get_tokio_indexing_worker_pool().spawn(async move {
             loop {
                 let first_batch;
                 loop {
@@ -483,7 +542,7 @@ impl<D: Document> IndexWriter<D> {
     }
 
     fn start_workers(&mut self) -> crate::Result<()> {
-        for _ in 0..self.options.num_worker_threads {
+        for _ in 0..self.options.num_indexing_worker {
             self.add_indexing_worker()?;
         }
         Ok(())
@@ -585,7 +644,12 @@ impl<D: Document> IndexWriter<D> {
             .take()
             .expect("The IndexWriter does not have any lock. This is a bug, please report.");
 
-        let new_index_writer = IndexWriter::new(&self.index, self.options.clone(), directory_lock)?;
+        let new_index_writer = IndexWriter::new(
+            &self.index,
+            self.options.clone(),
+            self.singleton_options.clone(),
+            directory_lock,
+        )?;
 
         // the current `self` is dropped right away because of this call.
         //
@@ -598,7 +662,7 @@ impl<D: Document> IndexWriter<D> {
         //
         // This will reach an end as the only document_sender
         // was dropped with the index_writer.
-        TOKIO_RUNTIME.block_on(async move {
+        get_tokio_indexing_worker_pool().block_on(async move {
             if let Ok(document_receiver) = document_receiver_res {
                 while document_receiver.recv().await.is_ok() {}
             }
@@ -648,9 +712,10 @@ impl<D: Document> IndexWriter<D> {
         let former_workers_join_handle = std::mem::take(&mut self.workers_join_handle);
 
         for worker_handle in former_workers_join_handle {
-            let indexing_worker_result = TOKIO_RUNTIME
-                .block_on(worker_handle)
-                .map_err(|e| TantivyError::ErrorInThread(format!("{e:?}")))?;
+            let indexing_worker_result =
+                get_tokio_indexing_worker_pool()
+                    .block_on(worker_handle)
+                    .map_err(|e| TantivyError::ErrorInThread(format!("{e:?}")))?;
             indexing_worker_result?;
             self.add_indexing_worker()?;
         }
@@ -812,7 +877,9 @@ impl<D: Document> IndexWriter<D> {
         if self.index_writer_status.is_alive() {
             let sender: Arc<async_channel::Sender<SmallVec<[AddOperation<D>; 4]>>> =
                 Arc::clone(&self.operation_sender);
-            if TOKIO_RUNTIME.block_on(async move { sender.send(add_ops).await.is_ok() }) {
+            if get_tokio_indexing_worker_pool()
+                .block_on(async move { sender.send(add_ops).await.is_ok() })
+            {
                 return Ok(());
             }
         }
@@ -825,7 +892,7 @@ impl<D: Document> Drop for IndexWriter<D> {
         self.segment_updater.kill();
         self.drop_sender();
         for work in self.workers_join_handle.drain(..) {
-            let _ = TOKIO_RUNTIME.block_on(work);
+            let _ = get_tokio_indexing_worker_pool().block_on(work);
         }
     }
 }
@@ -843,7 +910,7 @@ mod tests {
     use crate::collector::{Count, TopDocs};
     use crate::directory::error::LockError;
     use crate::error::*;
-    use crate::indexer::index_writer::MEMORY_BUDGET_NUM_BYTES_MIN;
+    use crate::indexer::index_writer::{SingletonIndexWriterOptions, MEMORY_BUDGET_NUM_BYTES_MIN};
     use crate::indexer::{IndexWriterOptions, NoMergePolicy};
     use crate::query::{QueryParser, TermQuery};
     use crate::schema::{
@@ -2569,18 +2636,24 @@ mod tests {
     #[test]
     fn test_writer_options_validation() {
         let mut schema_builder = Schema::builder();
-        let field = schema_builder.add_bool_field("example", STORED);
+        let _ = schema_builder.add_bool_field("example", STORED);
         let index = Index::create_in_ram(schema_builder.build());
 
-        let opt_wo_threads = IndexWriterOptions::builder().num_worker_threads(0).build();
-        let result = index.writer_with_options::<TantivyDocument>(opt_wo_threads);
+        let opt_wo_threads = IndexWriterOptions::builder().num_indexing_worker(0).build();
+        let result = index.writer_with_options::<TantivyDocument>(
+            opt_wo_threads,
+            SingletonIndexWriterOptions::default(),
+        );
         assert!(result.is_err(), "Writer should reject 0 thread count");
         assert!(matches!(result, Err(TantivyError::InvalidArgument(_))));
 
         let opt_with_low_memory = IndexWriterOptions::builder()
             .memory_budget_per_thread(10 << 10)
             .build();
-        let result = index.writer_with_options::<TantivyDocument>(opt_with_low_memory);
+        let result = index.writer_with_options::<TantivyDocument>(
+            opt_with_low_memory,
+            SingletonIndexWriterOptions::default(),
+        );
         assert!(
             result.is_err(),
             "Writer should reject options with too low memory size"
@@ -2590,7 +2663,10 @@ mod tests {
         let opt_with_low_memory = IndexWriterOptions::builder()
             .memory_budget_per_thread(5 << 30)
             .build();
-        let result = index.writer_with_options::<TantivyDocument>(opt_with_low_memory);
+        let result = index.writer_with_options::<TantivyDocument>(
+            opt_with_low_memory,
+            SingletonIndexWriterOptions::default(),
+        );
         assert!(
             result.is_err(),
             "Writer should reject options with too high memory size"
