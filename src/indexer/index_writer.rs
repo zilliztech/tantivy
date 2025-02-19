@@ -228,7 +228,7 @@ async fn index_documents<D: Document>(
     meta.untrack_temp_docstore();
     // update segment_updater inventory to remove tempstore
     let segment_entry = SegmentEntry::new(meta, delete_cursor, alive_bitset_opt);
-    segment_updater.schedule_add_segment(segment_entry).wait()?;
+    segment_updater.schedule_add_segment(segment_entry).await?;
     Ok(())
 }
 
