@@ -60,7 +60,7 @@ pub struct IndexWriterOptions {
     #[builder(default = 4)]
     /// Defines the number of merger workers to use.
     // todo(SpadeA): we should use this to limit the running merge operations
-    _num_merge_worker: usize,
+    num_merge_worker: usize,
 }
 
 #[derive(Clone, bon::Builder)]
@@ -378,8 +378,12 @@ impl<D: Document> IndexWriter<D> {
 
         let stamper = Stamper::new(current_opstamp);
 
-        let segment_updater =
-            SegmentUpdater::create(index.clone(), stamper.clone(), &delete_queue.cursor())?;
+        let segment_updater = SegmentUpdater::create(
+            index.clone(),
+            stamper.clone(),
+            &delete_queue.cursor(),
+            options.num_merge_worker,
+        )?;
 
         let mut index_writer = Self {
             _directory_lock: Some(directory_lock),
