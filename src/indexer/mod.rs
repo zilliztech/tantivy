@@ -37,7 +37,7 @@ pub use self::merge_operation::MergeOperation;
 pub use self::merge_policy::{MergeCandidate, MergePolicy, NoMergePolicy};
 use self::operation::AddOperation;
 pub use self::operation::UserOperation;
-pub use self::pool::TOKIO_DOCSTORE_COMPRESS_RUNTIME;
+pub use self::pool::get_tokio_docstore_compress_worker_pool;
 pub use self::prepared_commit::PreparedCommit;
 pub use self::segment_entry::SegmentEntry;
 pub use self::segment_serializer::SegmentSerializer;

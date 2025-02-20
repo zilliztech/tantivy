@@ -16,7 +16,7 @@ use crate::directory::{Directory, ManagedDirectory, RamDirectory, INDEX_WRITER_L
 use crate::error::{DataCorruption, TantivyError};
 use crate::index::{IndexMeta, SegmentId, SegmentMeta, SegmentMetaInventory};
 use crate::indexer::index_writer::{
-    IndexWriterOptions, MAX_NUM_THREAD, MEMORY_BUDGET_NUM_BYTES_MIN,
+    IndexWriterOptions, SingletonIndexWriterOptions, MAX_NUM_THREAD, MEMORY_BUDGET_NUM_BYTES_MIN,
 };
 use crate::indexer::segment_updater::save_metas;
 use crate::indexer::{IndexWriter, SingleSegmentIndexWriter};
@@ -539,6 +539,7 @@ impl Index {
     pub fn writer_with_options<D: Document>(
         &self,
         options: IndexWriterOptions,
+        singleton_options: SingletonIndexWriterOptions,
     ) -> crate::Result<IndexWriter<D>> {
         let directory_lock = self
             .directory
@@ -555,7 +556,7 @@ impl Index {
                 )
             })?;
 
-        IndexWriter::new(self, options, directory_lock)
+        IndexWriter::new(self, options, singleton_options, directory_lock)
     }
 
     /// Open a new index writer. Attempts to acquire a lockfile.
@@ -584,10 +585,12 @@ impl Index {
     ) -> crate::Result<IndexWriter<D>> {
         let memory_arena_in_bytes_per_thread = overall_memory_budget_in_bytes / num_threads;
         let options = IndexWriterOptions::builder()
-            .num_worker_threads(num_threads)
+            .num_indexing_worker(num_threads)
             .memory_budget_per_thread(memory_arena_in_bytes_per_thread)
             .build();
-        self.writer_with_options(options)
+
+        let singleton_option = SingletonIndexWriterOptions::default();
+        self.writer_with_options(options, singleton_option)
     }
 
     /// Helper to create an index writer for tests.

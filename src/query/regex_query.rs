@@ -102,9 +102,9 @@ impl RegexQuery {
                 json_path_bytes: Some(json_path_bytes.to_vec()),
             })
         } else {
-            Err(TantivyError::InvalidArgument(format!(
-                "The regex query requires a json path for a json term."
-            )))
+            Err(TantivyError::InvalidArgument(
+                ("The regex query requires a json path for a json term.").to_string(),
+            ))
         }
     }
 

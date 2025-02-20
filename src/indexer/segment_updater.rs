@@ -18,7 +18,7 @@ use crate::indexer::delete_queue::DeleteCursor;
 use crate::indexer::index_writer::advance_deletes;
 use crate::indexer::merge_operation::MergeOperationInventory;
 use crate::indexer::merger::IndexMerger;
-use crate::indexer::pool::TOKIO_MERGER_THREAD_POOL;
+use crate::indexer::pool::get_tokio_merger_worker_pool;
 use crate::indexer::segment_manager::SegmentsStatus;
 use crate::indexer::stamper::Stamper;
 use crate::indexer::{
@@ -279,7 +279,7 @@ impl SegmentUpdater {
         let index_meta = index.load_metas()?;
         Ok(SegmentUpdater(Arc::new(InnerSegmentUpdater {
             active_index_meta: RwLock::new(Arc::new(index_meta)),
-            pool: &pool::WRITER_THREAD_POOL,
+            pool: pool::get_segment_updater_pool(),
             index,
             segment_manager,
             merge_policy: RwLock::new(Arc::new(DefaultMergePolicy::default())),
@@ -483,7 +483,7 @@ impl SegmentUpdater {
         let (scheduled_result, merging_future_send) =
             FutureResult::create("Merge operation failed.");
 
-        TOKIO_MERGER_THREAD_POOL.spawn(async move {
+        get_tokio_merger_worker_pool().spawn(async move {
             // The fact that `merge_operation` is moved here is important.
             // Its lifetime is used to track how many merging thread are currently running,
             // as well as which segment is currently in merge and therefore should not be
