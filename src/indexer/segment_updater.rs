@@ -19,7 +19,7 @@ use crate::indexer::delete_queue::DeleteCursor;
 use crate::indexer::index_writer::advance_deletes;
 use crate::indexer::merge_operation::MergeOperationInventory;
 use crate::indexer::merger::IndexMerger;
-use crate::indexer::pool::TOKIO_MERGER_THREAD_POOL;
+use crate::indexer::pool::get_tokio_merger_worker_pool;
 use crate::indexer::segment_manager::SegmentsStatus;
 use crate::indexer::stamper::Stamper;
 use crate::indexer::{
@@ -282,7 +282,7 @@ impl SegmentUpdater {
         let index_meta = index.load_metas()?;
         Ok(SegmentUpdater(Arc::new(InnerSegmentUpdater {
             active_index_meta: RwLock::new(Arc::new(index_meta)),
-            pool: &pool::WRITER_THREAD_POOL,
+            pool: pool::get_segment_updater_pool(),
             index,
             segment_manager,
             merge_policy: RwLock::new(Arc::new(DefaultMergePolicy::default())),
@@ -486,7 +486,7 @@ impl SegmentUpdater {
             FutureResult::create("Merge operation failed.");
         let semaphore = self.semaphore.clone();
 
-        TOKIO_MERGER_THREAD_POOL.spawn(async move {
+        get_tokio_merger_worker_pool().spawn(async move {
             let _guard = semaphore.acquire().await.unwrap();
 
             info!("Starting merge  - {:?}", merge_operation.segment_ids());

@@ -1,89 +1,86 @@
-use std::str::FromStr;
-use std::{env, thread};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
-use lazy_static::lazy_static;
 use rayon::{ThreadPool, ThreadPoolBuilder};
+use tokio::runtime;
 
-const MILVUS_TOKIO_MERGER_THREAD_NUM: &str = "MILVUS_TANTIVY_MERGER_THREAD_NUM";
-const MILVUS_TANTIVY_WRITER_THREAD_NUM: &str = "MILVUS_TANTIVY_WRITER_THREAD_NUM";
-const MILVUS_TOKIO_THREAD_NUM: &str = "MILVUS_TOKIO_THREAD_NUM";
-const MILVUS_TOKIO_DOCSTORE_COMPRESS_THREAD_NUM: &str =
-    "MILVUS_TANTIVY_DOCSTORE_COMPRESS_THREAD_NUM";
+use super::index_writer::SingletonIndexWriterOptions;
 
-lazy_static! {
-    pub static ref TOKIO_RUNTIME: tokio::runtime::Runtime =
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(get_num_thread(MILVUS_TOKIO_THREAD_NUM))
+pub static TOKIO_INDEXING_WORKER_POOL: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+pub static SEGMENT_UPDATER_POOL: OnceLock<ThreadPool> = OnceLock::new();
+pub static TOKIO_MERGER_WORKER_POOL: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+pub static TOKIO_DOCSTORE_COMPRESS_WORKER_POOL: OnceLock<runtime::Runtime> = OnceLock::new();
+
+// The initialization of the pool will be executed exactly once.
+pub(crate) fn init_pool(singleton_options: SingletonIndexWriterOptions) {
+    let _ = TOKIO_INDEXING_WORKER_POOL.get_or_init(|| {
+        runtime::Builder::new_multi_thread()
+            .worker_threads(singleton_options.singleton_tokio_indexing_worker_threads)
             .enable_all()
+            .thread_name_fn(|| {
+                static ATOMIC_ID: AtomicUsize = AtomicUsize::new(0);
+                let id = ATOMIC_ID.fetch_add(1, Ordering::Relaxed);
+                format!("tantivy-indexing-worker-{}", id)
+            })
             .build()
-            .expect("Failed to create tokio runtime");
-    pub static ref WRITER_THREAD_POOL: ThreadPool = ThreadPoolBuilder::new()
-        .num_threads(get_num_thread(MILVUS_TANTIVY_WRITER_THREAD_NUM))
-        .thread_name(|sz| format!("tantivy-writer{}", sz))
-        .build()
-        .expect("Failed to create tantivy-writer thread pool");
-    pub static ref TOKIO_MERGER_THREAD_POOL: tokio::runtime::Runtime =
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(get_num_thread(MILVUS_TOKIO_MERGER_THREAD_NUM))
-            .thread_name("tantivy-merger")
-            .build()
-            .expect("Failed to create tantivy-writer thread pool");
-    pub static ref TOKIO_DOCSTORE_COMPRESS_RUNTIME: tokio::runtime::Runtime =
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(get_num_thread(MILVUS_TOKIO_DOCSTORE_COMPRESS_THREAD_NUM))
-            .thread_name("tantivy-docstore-compress")
+            .expect("Failed to create tokio runtime")
+    });
+
+    let _ = TOKIO_MERGER_WORKER_POOL.get_or_init(|| {
+        runtime::Builder::new_multi_thread()
+            .worker_threads(singleton_options.singleton_tokio_merge_worker_threads)
             .enable_all()
+            .thread_name_fn(|| {
+                static ATOMIC_ID: AtomicUsize = AtomicUsize::new(0);
+                let id = ATOMIC_ID.fetch_add(1, Ordering::Relaxed);
+                format!("tantivy-merger-worker-{}", id)
+            })
             .build()
-            .expect("Failed to create tokio runtime");
+            .expect("Failed to create tokio runtime")
+    });
+
+    let _ = TOKIO_DOCSTORE_COMPRESS_WORKER_POOL.get_or_init(|| {
+        runtime::Builder::new_multi_thread()
+            .worker_threads(singleton_options.singleton_tokio_docstore_worker_threads)
+            .enable_all()
+            .thread_name_fn(|| {
+                static ATOMIC_ID: AtomicUsize = AtomicUsize::new(0);
+                let id = ATOMIC_ID.fetch_add(1, Ordering::Relaxed);
+                format!("tantivy-docstore-worker-{}", id)
+            })
+            .build()
+            .expect("Failed to create tokio runtime")
+    });
+
+    let _ = SEGMENT_UPDATER_POOL.get_or_init(|| {
+        ThreadPoolBuilder::new()
+            .num_threads(singleton_options.singleton_segment_updater_worker_threads)
+            .thread_name(|sz| format!("tantivy-segment-updater-{}", sz))
+            .build()
+            .expect("Failed to create tantivy-writer thread pool")
+    });
 }
 
-fn default_num_thread() -> usize {
-    thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
+// It must be called after [`init_pool`].
+#[inline]
+pub fn get_tokio_indexing_worker_pool() -> &'static runtime::Runtime {
+    TOKIO_INDEXING_WORKER_POOL.get().unwrap()
 }
 
-fn get_num_thread(thread_num_env_key: &str) -> usize {
-    // Use the environment variable to change the thread num for high priority.
-    if let Some(x @ 1..) = env::var(thread_num_env_key)
-        .ok()
-        .and_then(|s| usize::from_str(&s).ok())
-    {
-        return x;
-    }
-
-    default_num_thread()
+// It must be called after [`init_pool`].
+#[inline]
+pub fn get_tokio_merger_worker_pool() -> &'static runtime::Runtime {
+    TOKIO_MERGER_WORKER_POOL.get().unwrap()
 }
 
-#[cfg(test)]
-mod tests {
-    use std::env;
+// It must be called after [`init_pool`].
+#[inline]
+pub fn get_tokio_docstore_compress_worker_pool() -> &'static runtime::Runtime {
+    TOKIO_DOCSTORE_COMPRESS_WORKER_POOL.get().unwrap()
+}
 
-    use super::{
-        default_num_thread, get_num_thread, MILVUS_TANTIVY_WRITER_THREAD_NUM,
-        MILVUS_TOKIO_MERGER_THREAD_NUM,
-    };
-
-    #[test]
-    fn test_get_num_thread() {
-        let default_num = default_num_thread();
-        let test_one = |env_var: &str| {
-            let thread_num = get_num_thread(env_var);
-            assert_eq!(thread_num, default_num);
-            env::set_var(env_var, "2");
-            let thread_num = get_num_thread(env_var);
-            assert_eq!(thread_num, 2);
-            env::set_var(env_var, "16");
-            let thread_num = get_num_thread(env_var);
-            assert_eq!(thread_num, 16);
-            env::set_var(env_var, "0");
-            let thread_num = get_num_thread(env_var);
-            assert_eq!(thread_num, default_num);
-            env::set_var(env_var, "a");
-            let thread_num = get_num_thread(env_var);
-            assert_eq!(thread_num, default_num);
-        };
-        test_one(MILVUS_TOKIO_MERGER_THREAD_NUM);
-        test_one(MILVUS_TANTIVY_WRITER_THREAD_NUM);
-    }
+// It must be called after [`init_pool`].
+#[inline]
+pub fn get_segment_updater_pool() -> &'static ThreadPool {
+    SEGMENT_UPDATER_POOL.get().unwrap()
 }
