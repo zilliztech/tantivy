@@ -567,7 +567,8 @@ impl Index {
     /// `IndexWriter` on the system is accessing the index directory,
     /// it is safe to manually delete the lockfile.
     ///
-    /// - `num_threads` defines the number of indexing workers that should work at the same time.
+    /// - `num_threads` defines the number of indexing workers and running merge tasks that should
+    ///   work at the same time.
     ///
     /// - `overall_memory_budget_in_bytes` sets the amount of memory allocated for all indexing
     ///   thread.
@@ -586,6 +587,7 @@ impl Index {
         let memory_arena_in_bytes_per_thread = overall_memory_budget_in_bytes / num_threads;
         let options = IndexWriterOptions::builder()
             .num_indexing_worker(num_threads)
+            .running_merge_limit(num_threads)
             .memory_budget_per_thread(memory_arena_in_bytes_per_thread)
             .build();
 
