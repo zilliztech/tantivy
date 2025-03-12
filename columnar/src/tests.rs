@@ -524,6 +524,41 @@ impl AssertEqualToColumnValue for DateTime {
     }
 }
 
+fn assert_column_values_batch<
+    T: AssertEqualToColumnValue
+        + PartialEq
+        + Copy
+        + PartialOrd
+        + Default
+        + Debug
+        + Send
+        + Sync
+        + 'static,
+>(
+    col: &Column<T>,
+    expected: &HashMap<u32, Vec<&ColumnValue>>,
+) {
+    let doc_ids = (0..col.num_docs()).collect::<Vec<_>>();
+    let expected_value_flatten = doc_ids
+        .iter()
+        .flat_map(|id| {
+            expected
+                .get(id)
+                .cloned()
+                .unwrap_or_default()
+                .clone()
+                .into_iter()
+        })
+        .collect::<Vec<_>>();
+    for (val, expected_val) in col
+        .values_for_docs_flatten(&doc_ids)
+        .iter()
+        .zip(expected_value_flatten.iter())
+    {
+        val.assert_equal_to_column_value(expected_val);
+    }
+}
+
 fn assert_column_values<
     T: AssertEqualToColumnValue + PartialEq + Copy + PartialOrd + Debug + Send + Sync + 'static,
 >(
@@ -607,18 +642,28 @@ proptest! {
             let col_category: ColumnTypeCategory = dynamic_column.column_type().into();
             let expected_col_values: &HashMap<u32, Vec<&ColumnValue>> = expected_columns.get(&(column_name.as_str(), col_category)).unwrap();
             match &dynamic_column {
-                DynamicColumn::Bool(col) =>
-                    assert_column_values(col, expected_col_values),
-                DynamicColumn::I64(col) =>
-                    assert_column_values(col, expected_col_values),
-                DynamicColumn::U64(col) =>
-                    assert_column_values(col, expected_col_values),
-                DynamicColumn::F64(col) =>
-                    assert_column_values(col, expected_col_values),
+                DynamicColumn::Bool(col) => {
+                    assert_column_values(col, expected_col_values);
+                    assert_column_values_batch(col, expected_col_values);
+                }
+                DynamicColumn::I64(col) =>{
+                    assert_column_values(col, expected_col_values);
+                    assert_column_values_batch(col, expected_col_values);
+                }
+                DynamicColumn::U64(col) =>{
+                    assert_column_values(col, expected_col_values);
+                    assert_column_values_batch(col, expected_col_values);
+                }
+                DynamicColumn::F64(col) =>{
+                    assert_column_values(col, expected_col_values);
+                    assert_column_values_batch(col, expected_col_values);
+                }
                 DynamicColumn::IpAddr(col) =>
                     assert_column_values(col, expected_col_values),
-                DynamicColumn::DateTime(col) =>
-                    assert_column_values(col, expected_col_values),
+                DynamicColumn::DateTime(col) =>{
+                    assert_column_values(col, expected_col_values);
+                    assert_column_values_batch(col, expected_col_values);
+                }
                 DynamicColumn::Bytes(col) =>
                     assert_bytes_column_values(col, expected_col_values, false),
                 DynamicColumn::Str(col) =>

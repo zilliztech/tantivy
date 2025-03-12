@@ -136,6 +136,22 @@ impl<T: PartialOrd + Copy + Debug + Send + Sync + 'static> Column<T> {
             .map(|value_row_id: RowId| self.values.get_val(value_row_id))
     }
 
+    /// Get batch of values for the provided docids.
+    /// Note: there may be multiple or no values for a specific doc_id, and the
+    /// values returned are flattened.
+    pub fn values_for_docs_flatten(&self, doc_ids: &[DocId]) -> Vec<T>
+    where T: Default {
+        let mut doc_ids_out = Vec::with_capacity(doc_ids.len());
+        let mut row_ids = Vec::with_capacity(doc_ids.len());
+        self.row_ids_for_docs(doc_ids, &mut doc_ids_out, &mut row_ids);
+        let mut values = (0..row_ids.len())
+            .into_iter()
+            .map(|_| T::default())
+            .collect::<Vec<_>>();
+        self.values.get_vals(&row_ids, &mut values);
+        values
+    }
+
     /// Get the docids of values which are in the provided value and docid range.
     #[inline]
     pub fn get_docids_for_value_range(
