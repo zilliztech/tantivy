@@ -64,19 +64,23 @@ pub trait ColumnValues<T: PartialOrd = u64>: Send + Sync + DowncastSync {
     /// May panic if `idx` is greater than the column length.
     fn get_vals(&self, indexes: &[u32], output: &mut [T]) {
         assert!(indexes.len() == output.len());
-        let out_and_idx_chunks = output.chunks_exact_mut(4).zip(indexes.chunks_exact(4));
-        for (out_x4, idx_x4) in out_and_idx_chunks {
-            out_x4[0] = self.get_val(idx_x4[0]);
-            out_x4[1] = self.get_val(idx_x4[1]);
-            out_x4[2] = self.get_val(idx_x4[2]);
-            out_x4[3] = self.get_val(idx_x4[3]);
+        let out_and_idx_chunks = output.chunks_exact_mut(8).zip(indexes.chunks_exact(8));
+        for (out_x8, idx_x8) in out_and_idx_chunks {
+            out_x8[0] = self.get_val(idx_x8[0]);
+            out_x8[1] = self.get_val(idx_x8[1]);
+            out_x8[2] = self.get_val(idx_x8[2]);
+            out_x8[3] = self.get_val(idx_x8[3]);
+            out_x8[4] = self.get_val(idx_x8[4]);
+            out_x8[5] = self.get_val(idx_x8[5]);
+            out_x8[6] = self.get_val(idx_x8[6]);
+            out_x8[7] = self.get_val(idx_x8[7]);
         }
 
         let out_and_idx_chunks = output
-            .chunks_exact_mut(4)
+            .chunks_exact_mut(8)
             .into_remainder()
             .iter_mut()
-            .zip(indexes.chunks_exact(4).remainder());
+            .zip(indexes.chunks_exact(8).remainder());
         for (out, idx) in out_and_idx_chunks {
             *out = self.get_val(*idx);
         }
