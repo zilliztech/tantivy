@@ -14,6 +14,7 @@ pub struct DeleteOperation {
 pub struct AddOperation<D: Document = TantivyDocument> {
     pub opstamp: Opstamp,
     pub document: D,
+    pub doc_id: Option<u32>,
 }
 
 /// UserOperation is an enum type that encapsulates other operation types.

@@ -144,9 +144,7 @@ impl SegmentWriter {
             + self.segment_serializer.mem_usage()
     }
 
-    fn index_document<D: Document>(&mut self, doc: &D) -> crate::Result<()> {
-        let doc_id = self.max_doc;
-
+    fn index_document<D: Document>(&mut self, doc_id: u32, doc: &D) -> crate::Result<()> {
         // TODO: Can this be optimised a bit?
         let vals_grouped_by_field = doc
             .iter_fields_and_values()
@@ -343,19 +341,55 @@ impl SegmentWriter {
         Ok(())
     }
 
-    /// Indexes a new document
-    ///
-    /// As a user, you should rather use `IndexWriter`'s add_document.
     pub async fn add_document<D: Document>(
         &mut self,
         add_operation: AddOperation<D>,
     ) -> crate::Result<()> {
-        let AddOperation { document, opstamp } = add_operation;
+        if self.segment_serializer.segment().user_specified_doc_id() {
+            self.add_document_with_specified_id(add_operation).await
+        } else {
+            self.add_document_with_default_id(add_operation).await
+        }
+    }
+
+    /// Indexes a new document
+    ///
+    /// As a user, you should rather use `IndexWriter`'s add_document.
+    pub async fn add_document_with_default_id<D: Document>(
+        &mut self,
+        add_operation: AddOperation<D>,
+    ) -> crate::Result<()> {
+        let AddOperation {
+            document,
+            opstamp,
+            doc_id,
+        } = add_operation;
+        assert!(doc_id.is_none());
         self.doc_opstamps.push(opstamp);
         self.fast_field_writers.add_document(&document)?;
-        self.index_document(&document)?;
+
+        let doc_id = self.max_doc;
+        self.index_document(doc_id, &document)?;
         let doc_writer = self.segment_serializer.get_store_writer();
         doc_writer.store(&document, &self.schema).await?;
+        self.max_doc += 1;
+        Ok(())
+    }
+
+    /// Indexes a new document with a given doc_id
+    ///
+    /// In this case, we must not have field with fast field as well as stored.
+    pub async fn add_document_with_specified_id<D: Document>(
+        &mut self,
+        add_operation: AddOperation<D>,
+    ) -> crate::Result<()> {
+        let AddOperation {
+            document,
+            opstamp,
+            doc_id,
+        } = add_operation;
+        self.doc_opstamps.push(opstamp);
+        self.index_document(doc_id.unwrap(), &document)?;
         self.max_doc += 1;
         Ok(())
     }

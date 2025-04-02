@@ -87,4 +87,10 @@ impl Segment {
         let write = self.index.directory_mut().open_write(&path)?;
         Ok(write)
     }
+
+    /// Returns true if the segment has user specified doc id.
+    #[inline]
+    pub fn user_specified_doc_id(&self) -> bool {
+        self.index.schema().user_specified_doc_id()
+    }
 }

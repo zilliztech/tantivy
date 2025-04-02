@@ -284,6 +284,19 @@ pub const TEXT: TextOptions = TextOptions {
     fast: FastFieldTextOptions::IsEnabled(false),
 };
 
+/// Used for creating inverted index with user specified doc_id.
+// It bans fieldnorms as the fieldnorms are highly coupled with tantivy inner doc id.
+pub const TEXT_WITH_DOC_ID: TextOptions = TextOptions {
+    indexing: Some(TextFieldIndexing {
+        tokenizer: TokenizerName::from_static(DEFAULT_TOKENIZER_NAME),
+        fieldnorms: false,
+        record: IndexRecordOption::WithFreqsAndPositions,
+    }),
+    stored: false,
+    coerce: false,
+    fast: FastFieldTextOptions::IsEnabled(false),
+};
+
 impl<T: Into<TextOptions>> BitOr<T> for TextOptions {
     type Output = TextOptions;
 
