@@ -234,56 +234,6 @@ impl DocIdMapper {
     }
 }
 
-fn serialize_merged_terms_for_default_id(
-    term_bytes: &[u8],
-    field_serializer: &mut FieldSerializer,
-    has_term_freq: bool,
-    total_doc_freq: u32,
-    segment_postings_containing_the_term: &mut Vec<(usize, SegmentPostings)>,
-    positions_buffer: &mut Vec<u32>,
-    delta_computer: &mut DeltaComputer,
-    doc_id_mapper: &DocIdMapper,
-) -> crate::Result<()> {
-    field_serializer.new_term(term_bytes, total_doc_freq, has_term_freq)?;
-
-    // We can now serialize this postings, by pushing each document to the
-    // postings serializer.
-    for (segment_ord, mut segment_postings) in segment_postings_containing_the_term.drain(..) {
-        let old_to_new_doc_id = &doc_id_mapper.segment_doc_id_mapper(segment_ord);
-
-        let mut doc = segment_postings.doc();
-        while doc != TERMINATED {
-            println!("doc_id: {}", doc);
-            // deleted doc are skipped as they do not have a `remapped_doc_id`.
-            if let Some(remapped_doc_id) = old_to_new_doc_id.remapped_doc_id(doc) {
-                println!("  doc_id: {}, remapped_doc_id: {}", doc, remapped_doc_id);
-                // we make sure to only write the term if
-                // there is at least one document.
-                let term_freq = if has_term_freq {
-                    segment_postings.positions(positions_buffer);
-                    segment_postings.term_freq()
-                } else {
-                    // The positions_buffer may contain positions from the previous term
-                    // Existence of positions depend on the value type in JSON fields.
-                    // https://github.com/quickwit-oss/tantivy/issues/2283
-                    positions_buffer.clear();
-                    0u32
-                };
-
-                let delta_positions = delta_computer.compute_delta(&positions_buffer);
-                field_serializer.write_doc(remapped_doc_id, term_freq, delta_positions);
-            }
-
-            doc = segment_postings.advance();
-        }
-    }
-
-    // closing the term.
-    field_serializer.close_term()?;
-
-    Ok(())
-}
-
 struct PostingEntry<'a> {
     cur_doc: DocId,
     id_filter: SegmentDocIdMapper<'a>,
@@ -383,6 +333,54 @@ fn serialize_merged_terms_for_user_id(
 
         if next.advance() != TERMINATED {
             heap.push(next);
+        }
+    }
+
+    // closing the term.
+    field_serializer.close_term()?;
+
+    Ok(())
+}
+
+fn serialize_merged_terms_for_default_id(
+    term_bytes: &[u8],
+    field_serializer: &mut FieldSerializer,
+    has_term_freq: bool,
+    total_doc_freq: u32,
+    segment_postings_containing_the_term: &mut Vec<(usize, SegmentPostings)>,
+    positions_buffer: &mut Vec<u32>,
+    delta_computer: &mut DeltaComputer,
+    doc_id_mapper: &DocIdMapper,
+) -> crate::Result<()> {
+    field_serializer.new_term(term_bytes, total_doc_freq, has_term_freq)?;
+
+    // We can now serialize this postings, by pushing each document to the
+    // postings serializer.
+    for (segment_ord, mut segment_postings) in segment_postings_containing_the_term.drain(..) {
+        let old_to_new_doc_id = &doc_id_mapper.segment_doc_id_mapper(segment_ord);
+
+        let mut doc = segment_postings.doc();
+        while doc != TERMINATED {
+            // deleted doc are skipped as they do not have a `remapped_doc_id`.
+            if let Some(remapped_doc_id) = old_to_new_doc_id.remapped_doc_id(doc) {
+                // we make sure to only write the term if
+                // there is at least one document.
+                let term_freq = if has_term_freq {
+                    segment_postings.positions(positions_buffer);
+                    segment_postings.term_freq()
+                } else {
+                    // The positions_buffer may contain positions from the previous term
+                    // Existence of positions depend on the value type in JSON fields.
+                    // https://github.com/quickwit-oss/tantivy/issues/2283
+                    positions_buffer.clear();
+                    0u32
+                };
+
+                let delta_positions = delta_computer.compute_delta(&positions_buffer);
+                field_serializer.write_doc(remapped_doc_id, term_freq, delta_positions);
+            }
+
+            doc = segment_postings.advance();
         }
     }
 
