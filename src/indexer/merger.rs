@@ -15,7 +15,7 @@ use crate::fieldnorm::{FieldNormReader, FieldNormReaders, FieldNormsSerializer, 
 use crate::index::{Segment, SegmentComponent, SegmentReader};
 use crate::indexer::doc_id_mapping::{MappingType, SegmentDocIdMapping};
 use crate::indexer::SegmentSerializer;
-use crate::postings::{InvertedIndexSerializer, Postings, SegmentPostings};
+use crate::postings::{FieldSerializer, InvertedIndexSerializer, Postings, SegmentPostings};
 use crate::schema::{value_type_to_column_type, Field, FieldType, Schema};
 use crate::store::StoreWriter;
 use crate::termdict::{TermMerger, TermOrdinal};
@@ -214,6 +214,108 @@ impl DocIdMapper {
             }
         }
     }
+}
+
+fn serialize_merged_terms_for_default_id(
+    term_bytes: &[u8],
+    field_serializer: &mut FieldSerializer,
+    has_term_freq: bool,
+    total_doc_freq: u32,
+    segment_postings_containing_the_term: &mut Vec<(usize, SegmentPostings)>,
+    positions_buffer: &mut Vec<u32>,
+    delta_computer: &mut DeltaComputer,
+    doc_id_mapper: &DocIdMapper,
+) -> crate::Result<()> {
+    field_serializer.new_term(term_bytes, total_doc_freq, has_term_freq)?;
+
+    // We can now serialize this postings, by pushing each document to the
+    // postings serializer.
+    for (segment_ord, mut segment_postings) in segment_postings_containing_the_term.drain(..) {
+        let old_to_new_doc_id = &doc_id_mapper.segment_doc_id_mapper(segment_ord);
+
+        let mut doc = segment_postings.doc();
+        while doc != TERMINATED {
+            // deleted doc are skipped as they do not have a `remapped_doc_id`.
+            if let Some(remapped_doc_id) = old_to_new_doc_id.remapped_doc_id(doc) {
+                // we make sure to only write the term if
+                // there is at least one document.
+                let term_freq = if has_term_freq {
+                    segment_postings.positions(positions_buffer);
+                    segment_postings.term_freq()
+                } else {
+                    // The positions_buffer may contain positions from the previous term
+                    // Existence of positions depend on the value type in JSON fields.
+                    // https://github.com/quickwit-oss/tantivy/issues/2283
+                    positions_buffer.clear();
+                    0u32
+                };
+
+                let delta_positions = delta_computer.compute_delta(&positions_buffer);
+                field_serializer.write_doc(remapped_doc_id, term_freq, delta_positions);
+            }
+
+            doc = segment_postings.advance();
+        }
+    }
+
+    // closing the term.
+    field_serializer.close_term()?;
+
+    Ok(())
+}
+
+fn serialize_merged_terms_for_user_id(
+    term_bytes: &[u8],
+    field_serializer: &mut FieldSerializer,
+    has_term_freq: bool,
+    total_doc_freq: u32,
+    segment_postings_containing_the_term: &mut Vec<(usize, SegmentPostings)>,
+    positions_buffer: &mut Vec<u32>,
+    delta_computer: &mut DeltaComputer,
+    doc_id_mapper: &DocIdMapper,
+) -> crate::Result<()> {
+    field_serializer.new_term(term_bytes, total_doc_freq, has_term_freq)?;
+
+    let mut doc_ids = vec![];
+    // We can now serialize this postings, by pushing each document to the
+    // postings serializer.
+    for (segment_ord, mut segment_postings) in segment_postings_containing_the_term.drain(..) {
+        let old_to_new_doc_id = &doc_id_mapper.segment_doc_id_mapper(segment_ord);
+
+        let mut doc = segment_postings.doc();
+        while doc != TERMINATED {
+            // deleted doc are skipped as they do not have a `remapped_doc_id`.
+            if let Some(remapped_doc_id) = old_to_new_doc_id.remapped_doc_id(doc) {
+                // we make sure to only write the term if
+                // there is at least one document.
+                let term_freq = if has_term_freq {
+                    segment_postings.positions(positions_buffer);
+                    segment_postings.term_freq()
+                } else {
+                    // The positions_buffer may contain positions from the previous term
+                    // Existence of positions depend on the value type in JSON fields.
+                    // https://github.com/quickwit-oss/tantivy/issues/2283
+                    positions_buffer.clear();
+                    0u32
+                };
+
+                let delta_positions = delta_computer.compute_delta(&positions_buffer);
+                doc_ids.push((term_freq, remapped_doc_id, delta_positions.to_vec()));
+            }
+
+            doc = segment_postings.advance();
+        }
+    }
+
+    doc_ids.sort();
+    for (term_freq, doc_id, delta_positions) in doc_ids {
+        field_serializer.write_doc(doc_id, term_freq, &delta_positions);
+    }
+
+    // closing the term.
+    field_serializer.close_term()?;
+
+    Ok(())
 }
 
 impl IndexMerger {
@@ -490,49 +592,35 @@ impl IndexMerger {
                 has_term_freq
             };
 
-            field_serializer.new_term(term_bytes, total_doc_freq, has_term_freq)?;
-
-            let mut doc_ids = vec![];
-            // We can now serialize this postings, by pushing each document to the
-            // postings serializer.
-            for (segment_ord, mut segment_postings) in
-                segment_postings_containing_the_term.drain(..)
-            {
-                let old_to_new_doc_id = &doc_id_mapper.segment_doc_id_mapper(segment_ord);
-
-                let mut doc = segment_postings.doc();
-                while doc != TERMINATED {
-                    // deleted doc are skipped as they do not have a `remapped_doc_id`.
-                    if let Some(remapped_doc_id) = old_to_new_doc_id.remapped_doc_id(doc) {
-                        // we make sure to only write the term if
-                        // there is at least one document.
-                        let term_freq = if has_term_freq {
-                            segment_postings.positions(&mut positions_buffer);
-                            segment_postings.term_freq()
-                        } else {
-                            // The positions_buffer may contain positions from the previous term
-                            // Existence of positions depend on the value type in JSON fields.
-                            // https://github.com/quickwit-oss/tantivy/issues/2283
-                            positions_buffer.clear();
-                            0u32
-                        };
-
-                        let delta_positions = delta_computer.compute_delta(&positions_buffer);
-                        doc_ids.push((term_freq, remapped_doc_id, delta_positions.to_vec()));
-                        // field_serializer.write_doc(remapped_doc_id, term_freq, delta_positions);
-                    }
-
-                    doc = segment_postings.advance();
-                }
+            // what we have:
+            //      segment_postings_containing_the_term: term_bytes, [(segment_ord,
+            // segment_postings)...]
+            //
+            // what we want to do:
+            //      field_serializer 完成该 term 的序列化
+            if self.schema.user_specified_doc_id() {
+                serialize_merged_terms_for_user_id(
+                    term_bytes,
+                    &mut field_serializer,
+                    has_term_freq,
+                    total_doc_freq,
+                    &mut segment_postings_containing_the_term,
+                    &mut positions_buffer,
+                    &mut delta_computer,
+                    &doc_id_mapper,
+                )?;
+            } else {
+                serialize_merged_terms_for_default_id(
+                    term_bytes,
+                    &mut field_serializer,
+                    has_term_freq,
+                    total_doc_freq,
+                    &mut segment_postings_containing_the_term,
+                    &mut positions_buffer,
+                    &mut delta_computer,
+                    &doc_id_mapper,
+                )?;
             }
-
-            doc_ids.sort();
-            for (term_freq, doc_id, delta_positions) in doc_ids {
-                field_serializer.write_doc(doc_id, term_freq, &delta_positions);
-            }
-
-            // closing the term.
-            field_serializer.close_term()?;
         }
         field_serializer.close()?;
         Ok(())

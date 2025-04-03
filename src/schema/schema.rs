@@ -405,6 +405,7 @@ impl Serialize for Schema {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where S: Serializer {
         let mut seq = serializer.serialize_seq(Some(self.0.fields.len() + 1))?;
+
         seq.serialize_element(&DocIdConfig {
             user_specified_doc_id: self.0.user_specified_doc_id,
         })?;
@@ -420,6 +421,13 @@ impl Serialize for Schema {
 impl<'de> Deserialize<'de> for Schema {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where D: Deserializer<'de> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum SchemaElement {
+            Config(DocIdConfig),
+            Field(FieldEntry),
+        }
+
         struct SchemaVisitor;
 
         impl<'de> Visitor<'de> for SchemaVisitor {
@@ -437,15 +445,20 @@ impl<'de> Deserialize<'de> for Schema {
                     fields_map: HashMap::with_capacity(seq.size_hint().unwrap_or(0)),
                 };
 
-                if let Some(config) = seq.next_element::<DocIdConfig>()? {
-                    schema.user_specified_doc_id = config.user_specified_doc_id;
-                } else {
-                    return Err(serde::de::Error::custom(
-                        "expected user_specified_doc_id config",
-                    ));
+                // We should consider that schema produced by older version may not contains the
+                // user_specified_doc_id config.
+                if let Some(first_element) = seq.next_element::<SchemaElement>()? {
+                    match first_element {
+                        SchemaElement::Config(config) => {
+                            schema.user_specified_doc_id = config.user_specified_doc_id;
+                        }
+                        SchemaElement::Field(field) => {
+                            schema.add_field(field);
+                        }
+                    }
                 }
 
-                while let Some(value) = seq.next_element()? {
+                while let Some(value) = seq.next_element::<FieldEntry>()? {
                     schema.add_field(value);
                 }
 
