@@ -45,6 +45,7 @@ fn compute_initial_table_size(per_thread_memory_budget: usize) -> crate::Result<
 /// They creates the postings list in anonymous memory.
 /// The segment is laid on disk when the segment gets `finalized`.
 pub struct SegmentWriter {
+    pub(crate) num_docs: DocId,
     pub(crate) max_doc: DocId,
     pub(crate) ctx: IndexingContext,
     pub(crate) per_field_postings_writers: PerFieldPostingsWriter,
@@ -99,6 +100,7 @@ impl SegmentWriter {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
+            num_docs: 0,
             max_doc: 0,
             ctx: IndexingContext::new(table_size),
             per_field_postings_writers,
@@ -372,6 +374,7 @@ impl SegmentWriter {
         self.index_document(doc_id, &document)?;
         let doc_writer = self.segment_serializer.get_store_writer();
         doc_writer.store(&document, &self.schema).await?;
+        self.num_docs += 1;
         self.max_doc += 1;
         Ok(())
     }
@@ -390,7 +393,8 @@ impl SegmentWriter {
         } = add_operation;
         self.doc_opstamps.push(opstamp);
         self.index_document(doc_id.unwrap(), &document)?;
-        self.max_doc += 1;
+        self.num_docs += 1;
+        self.max_doc = std::cmp::max(self.max_doc, doc_id.unwrap() + 1);
         Ok(())
     }
 
@@ -401,16 +405,6 @@ impl SegmentWriter {
     /// Currently, **tantivy** does not handle deletes anyway,
     /// so `max_doc == num_docs`
     pub fn max_doc(&self) -> u32 {
-        self.max_doc
-    }
-
-    /// Number of documents in the index.
-    /// Deleted documents are not counted.
-    ///
-    /// Currently, **tantivy** does not handle deletes anyway,
-    /// so `max_doc == num_docs`
-    #[allow(dead_code)]
-    pub fn num_docs(&self) -> u32 {
         self.max_doc
     }
 }
