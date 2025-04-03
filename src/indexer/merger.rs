@@ -1,3 +1,4 @@
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use columnar::{
@@ -264,6 +265,63 @@ fn serialize_merged_terms_for_default_id(
     Ok(())
 }
 
+struct PostingEntry<'a> {
+    cur_doc: DocId,
+    id_filter: SegmentDocIdMapper<'a>,
+    postings: SegmentPostings,
+}
+
+impl<'a> PostingEntry<'a> {
+    fn new(
+        id_filter: SegmentDocIdMapper<'a>,
+        mut postings: SegmentPostings,
+    ) -> Option<PostingEntry<'a>> {
+        let mut doc_id = postings.doc();
+        while doc_id != TERMINATED {
+            if let Some(doc_id) = id_filter.remapped_doc_id(doc_id) {
+                return Some(PostingEntry {
+                    cur_doc: doc_id,
+                    id_filter,
+                    postings,
+                });
+            } else {
+                doc_id = postings.advance();
+            }
+        }
+        None
+    }
+
+    fn advance(&mut self) -> DocId {
+        let mut doc_id = self.postings.advance();
+        while doc_id != TERMINATED {
+            if let Some(doc_id) = self.id_filter.remapped_doc_id(doc_id) {
+                self.cur_doc = doc_id;
+                return doc_id;
+            } else {
+                doc_id = self.postings.advance();
+            }
+        }
+        TERMINATED
+    }
+}
+
+impl Ord for PostingEntry<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.cur_doc.cmp(&other.cur_doc)
+    }
+}
+impl PartialOrd for PostingEntry<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for PostingEntry<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cur_doc == other.cur_doc
+    }
+}
+impl Eq for PostingEntry<'_> {}
+
 fn serialize_merged_terms_for_user_id(
     term_bytes: &[u8],
     field_serializer: &mut FieldSerializer,
@@ -276,40 +334,35 @@ fn serialize_merged_terms_for_user_id(
 ) -> crate::Result<()> {
     field_serializer.new_term(term_bytes, total_doc_freq, has_term_freq)?;
 
-    let mut doc_ids = vec![];
-    // We can now serialize this postings, by pushing each document to the
-    // postings serializer.
-    for (segment_ord, mut segment_postings) in segment_postings_containing_the_term.drain(..) {
-        let old_to_new_doc_id = &doc_id_mapper.segment_doc_id_mapper(segment_ord);
-
-        let mut doc = segment_postings.doc();
-        while doc != TERMINATED {
-            // deleted doc are skipped as they do not have a `remapped_doc_id`.
-            if let Some(remapped_doc_id) = old_to_new_doc_id.remapped_doc_id(doc) {
-                // we make sure to only write the term if
-                // there is at least one document.
-                let term_freq = if has_term_freq {
-                    segment_postings.positions(positions_buffer);
-                    segment_postings.term_freq()
-                } else {
-                    // The positions_buffer may contain positions from the previous term
-                    // Existence of positions depend on the value type in JSON fields.
-                    // https://github.com/quickwit-oss/tantivy/issues/2283
-                    positions_buffer.clear();
-                    0u32
-                };
-
-                let delta_positions = delta_computer.compute_delta(&positions_buffer);
-                doc_ids.push((term_freq, remapped_doc_id, delta_positions.to_vec()));
-            }
-
-            doc = segment_postings.advance();
+    let mut heap = BinaryHeap::new();
+    for (segment_ord, postings) in segment_postings_containing_the_term.drain(..) {
+        // For user specified doc id, the mapping is just the identity. But we need it here
+        // to filter docs that are deleted.
+        let segment_doc_id_mapper = doc_id_mapper.segment_doc_id_mapper(segment_ord);
+        if let Some(posting_entry) = PostingEntry::new(segment_doc_id_mapper, postings) {
+            heap.push(posting_entry);
         }
     }
 
-    doc_ids.sort();
-    for (term_freq, doc_id, delta_positions) in doc_ids {
-        field_serializer.write_doc(doc_id, term_freq, &delta_positions);
+    while let Some(mut next) = heap.pop() {
+        let doc_id = next.cur_doc;
+        let term_freq = if has_term_freq {
+            next.postings.positions(positions_buffer);
+            next.postings.term_freq()
+        } else {
+            // The positions_buffer may contain positions from the previous term
+            // Existence of positions depend on the value type in JSON fields.
+            // https://github.com/quickwit-oss/tantivy/issues/2283
+            positions_buffer.clear();
+            0u32
+        };
+
+        let delta_positions = delta_computer.compute_delta(&positions_buffer);
+        field_serializer.write_doc(doc_id, term_freq, delta_positions);
+
+        if next.advance() != TERMINATED {
+            heap.push(next);
+        }
     }
 
     // closing the term.
