@@ -786,6 +786,8 @@ impl IndexMerger {
 #[cfg(test)]
 mod tests {
 
+    use std::collections::HashSet;
+
     use columnar::Column;
     use proptest::prop_oneof;
     use proptest::strategy::Strategy;
@@ -1806,6 +1808,51 @@ mod tests {
         // this is the first time I write a unit test for a constant.
         assert!(((super::MAX_DOC_LIMIT - 1) as i32) >= 0);
         assert!((super::MAX_DOC_LIMIT as i32) < 0);
+    }
+
+    #[test]
+    fn test_merge_with_default_doc_id() {
+        let mut builder = schema::SchemaBuilder::new();
+        let text = builder.add_text_field("text", TEXT);
+        builder.enable_user_specified_doc_id();
+        let index = Index::create_in_ram(builder.build());
+        assert!(!index.user_specified_doc_id());
+        let mut writer = index
+            .writer_with_num_threads(4, 4 * MEMORY_BUDGET_NUM_BYTES_MIN)
+            .unwrap();
+
+        for i in 0..1000 {
+            let k = format!("key{:04}", i);
+            let _ = writer
+                .add_document(doc!(
+                    text => k,
+                ))
+                .unwrap();
+        }
+
+        writer.commit().unwrap();
+
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let segment_ids: Vec<SegmentId> = searcher
+            .segment_readers()
+            .iter()
+            .map(|reader| reader.segment_id())
+            .collect();
+        writer.merge(&segment_ids[..]).wait().unwrap();
+
+        reader.reload().unwrap();
+        let searcher = reader.searcher();
+        let mut set: HashSet<DocAddress> = HashSet::default();
+        for i in 0..1000 {
+            let k = format!("key{:04}", i);
+            let term = Term::from_field_text(text, &k);
+            let term_query = TermQuery::new(term, IndexRecordOption::Basic);
+            let doc_set = searcher.search(&term_query, &DocSetCollector).unwrap();
+            assert_eq!(doc_set.len(), 1);
+            set.extend(doc_set.iter());
+        }
+        assert!(set.len() == 1000);
     }
 
     #[test]
