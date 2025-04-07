@@ -58,6 +58,7 @@ impl SegmentReader {
 
     /// Returns the number of alive documents.
     /// Deleted documents are not counted.
+    // FIXME: this is not accurate if user_specified_doc_id is enabled.
     pub fn num_docs(&self) -> DocId {
         self.num_docs
     }
@@ -185,6 +186,7 @@ impl SegmentReader {
         let alive_bitset_opt = intersect_alive_bitset(original_bitset, custom_bitset);
 
         let max_doc = segment.meta().max_doc();
+        // FIXME: this is not accurate if user_specified_doc_id is enabled.
         let num_docs = alive_bitset_opt
             .as_ref()
             .map(|alive_bitset| alive_bitset.num_alive_docs() as u32)

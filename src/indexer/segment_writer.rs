@@ -404,6 +404,8 @@ impl SegmentWriter {
     ///
     /// Currently, **tantivy** does not handle deletes anyway,
     /// so `max_doc == num_docs`
+    // **Note**: If user specified doc id is used, max_doc no longer equals to
+    // num_docs.
     pub fn max_doc(&self) -> u32 {
         self.max_doc
     }
