@@ -1,4 +1,5 @@
 use std::ops::Range;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -119,6 +120,8 @@ pub struct IndexWriter<D: Document = TantivyDocument> {
 
     stamper: Stamper,
     committed_opstamp: Opstamp,
+
+    last_doc_id_plus_one: Arc<AtomicU32>,
 }
 
 fn compute_deleted_bitset(
@@ -404,6 +407,7 @@ impl<D: Document> IndexWriter<D> {
             stamper,
 
             worker_id: 0,
+            last_doc_id_plus_one: Arc::new(AtomicU32::new(0)),
         };
         index_writer.start_workers()?;
         Ok(index_writer)
@@ -816,7 +820,32 @@ impl<D: Document> IndexWriter<D> {
         Ok(opstamp)
     }
 
+    fn check_with_doc_id(&self, doc_id: u32, count: usize) -> crate::Result<()> {
+        if !self.index.schema().user_specified_doc_id() {
+            return Err(TantivyError::InvalidArgument(
+                "User specified id is not enabled".to_string(),
+            ));
+        }
+
+        let last_doc_id_plus_one = self.last_doc_id_plus_one.load(Ordering::Relaxed);
+        if last_doc_id_plus_one != 0 && doc_id < last_doc_id_plus_one {
+            return Err(TantivyError::InvalidArgument(format!(
+                "Document ID must be strictly ordered: last doc id plus one {}, current doc id {}",
+                last_doc_id_plus_one, doc_id,
+            )));
+        }
+        self.last_doc_id_plus_one
+            .store(doc_id + count as u32, Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    /// Adds a document with a user-specified document id.
+    ///
+    /// The doc_id must be strictly in ascending order.
     pub fn add_document_with_doc_id(&self, doc_id: u32, document: D) -> crate::Result<Opstamp> {
+        self.check_with_doc_id(doc_id, 1)?;
+
         let opstamp = self.stamper.stamp();
         self.send_add_documents_batch(smallvec![AddOperation {
             opstamp,
@@ -824,6 +853,42 @@ impl<D: Document> IndexWriter<D> {
             doc_id: Some(doc_id),
         }])?;
         Ok(opstamp)
+    }
+
+    /// Adds a documents with user-specified document ids by batch.
+    ///
+    /// The doc_id must be strictly in ascending order.
+    pub fn add_documents_with_doc_id<I>(
+        &self,
+        doc_id_begin: u32,
+        documents: I,
+    ) -> crate::Result<Opstamp>
+    where
+        I: IntoIterator<Item = D>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let documents_it = documents.into_iter();
+        let count = documents_it.len();
+        if count == 0 {
+            return Ok(self.stamper.stamp());
+        }
+
+        self.check_with_doc_id(doc_id_begin, count)?;
+
+        let (batch_opstamp, stamps) = self.get_batch_opstamps(count as u64);
+        let mut adds = SmallVec::with_capacity(count);
+
+        for (idx, (document, opstamp)) in documents_it.zip(stamps).enumerate() {
+            let doc_id = doc_id_begin + idx as u32;
+            let add_operation = AddOperation {
+                opstamp,
+                document,
+                doc_id: Some(doc_id),
+            };
+            adds.push(add_operation);
+        }
+        self.send_add_documents_batch(adds)?;
+        Ok(batch_opstamp)
     }
 
     /// Gets a range of stamps from the stamper and "pops" the last stamp
@@ -867,7 +932,7 @@ impl<D: Document> IndexWriter<D> {
         }
         let (batch_opstamp, stamps) = self.get_batch_opstamps(count);
 
-        let mut adds = AddBatch::default();
+        let mut adds = SmallVec::with_capacity(count as usize);
 
         for (user_op, opstamp) in user_operations_it.zip(stamps) {
             match user_op {
@@ -929,7 +994,7 @@ mod tests {
     use proptest::prop_oneof;
 
     use super::super::operation::UserOperation;
-    use crate::collector::{Count, TopDocs};
+    use crate::collector::{Count, DocSetCollector, TopDocs};
     use crate::directory::error::LockError;
     use crate::error::*;
     use crate::indexer::index_writer::{SingletonIndexWriterOptions, MEMORY_BUDGET_NUM_BYTES_MIN};
@@ -938,7 +1003,7 @@ mod tests {
     use crate::schema::{
         self, Facet, FacetOptions, IndexRecordOption, IpAddrOptions, JsonObjectOptions,
         NumericOptions, Schema, TextFieldIndexing, TextOptions, Value, FAST, INDEXED, STORED,
-        STRING, TEXT,
+        STRING, TEXT, TEXT_WITH_DOC_ID,
     };
     use crate::store::DOCSTORE_CACHE_CAPACITY;
     use crate::{
@@ -2694,5 +2759,46 @@ mod tests {
             "Writer should reject options with too high memory size"
         );
         assert!(matches!(result, Err(TantivyError::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn test_add_documents_with_doc_id() {
+        let mut builder = schema::SchemaBuilder::new();
+        let text = builder.add_text_field("text", TEXT_WITH_DOC_ID);
+        builder.enable_user_specified_doc_id();
+        let index = Index::create_in_ram(builder.build());
+        let mut writer = index
+            .writer_with_num_threads(4, 4 * MEMORY_BUDGET_NUM_BYTES_MIN)
+            .unwrap();
+
+        let mut count = 0;
+        for i in 0..10 {
+            let mut documents = vec![];
+            for _ in 0..100 {
+                let k = format!("key{:04}", count);
+                count += 1;
+                documents.push(doc!(
+                    text => k,
+                ));
+            }
+            writer
+                .add_documents_with_doc_id(i * 100, documents)
+                .unwrap();
+        }
+
+        writer.commit().unwrap();
+
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        for i in 0..1000 {
+            let k = format!("key{:04}", i);
+            let term = Term::from_field_text(text, &k);
+            let term_query = TermQuery::new(term, IndexRecordOption::Basic);
+            let doc_set = searcher.search(&term_query, &DocSetCollector).unwrap();
+            assert_eq!(doc_set.len(), 1);
+            doc_set.iter().for_each(|doc| {
+                assert_eq!(doc.doc_id, i);
+            });
+        }
     }
 }

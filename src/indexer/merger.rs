@@ -220,16 +220,13 @@ impl DocIdMapper {
 
     #[inline]
     fn segment_doc_id_mapper(&self, seg_ord: usize) -> SegmentDocIdMapper {
-        if self.identity_mapping {
-            SegmentDocIdMapper {
-                identity_mapping: true,
-                doc_id_mapping: &[],
-            }
-        } else {
-            SegmentDocIdMapper {
-                identity_mapping: false,
-                doc_id_mapping: &self.merged_doc_id_map[seg_ord],
-            }
+        SegmentDocIdMapper {
+            identity_mapping: self.identity_mapping,
+            doc_id_mapping: if self.identity_mapping {
+                &[]
+            } else {
+                &self.merged_doc_id_map[seg_ord]
+            },
         }
     }
 }
@@ -263,9 +260,7 @@ impl<'a> PostingEntry<'a> {
     fn advance(&mut self) -> DocId {
         let mut doc_id = self.postings.advance();
         while doc_id != TERMINATED {
-            println!("advance doc_id: {}", doc_id);
             if let Some(doc_id) = self.id_filter.remapped_doc_id(doc_id) {
-                println!(" remapped doc_id: {}", doc_id);
                 self.cur_doc = doc_id;
                 return doc_id;
             } else {
