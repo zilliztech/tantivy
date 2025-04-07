@@ -1836,6 +1836,17 @@ mod tests {
 
         let reader = index.reader().unwrap();
         let searcher = reader.searcher();
+        for i in 0..1000 {
+            let k = format!("key{:04}", i);
+            let term = Term::from_field_text(text, &k);
+            let term_query = TermQuery::new(term, IndexRecordOption::Basic);
+            let doc_set = searcher.search(&term_query, &DocSetCollector).unwrap();
+            assert_eq!(doc_set.len(), 1);
+            doc_set.iter().for_each(|doc| {
+                assert_eq!(doc.doc_id, i);
+            });
+        }
+
         let segment_ids: Vec<SegmentId> = searcher
             .segment_readers()
             .iter()
