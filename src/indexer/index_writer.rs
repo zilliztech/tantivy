@@ -828,7 +828,7 @@ impl<D: Document> IndexWriter<D> {
         }
 
         let last_doc_id_plus_one = self.last_doc_id_plus_one.load(Ordering::Relaxed);
-        if last_doc_id_plus_one != 0 && doc_id < last_doc_id_plus_one {
+        if doc_id < last_doc_id_plus_one {
             return Err(TantivyError::InvalidArgument(format!(
                 "Document ID must be strictly ordered: last doc id plus one {}, current doc id {}",
                 last_doc_id_plus_one, doc_id,
