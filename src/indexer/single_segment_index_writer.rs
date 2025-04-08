@@ -28,7 +28,11 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
             let mut opstamp = 0;
             while let Ok(document) = rx.recv().await {
                 segment_writer
-                    .add_document(AddOperation { opstamp, document })
+                    .add_document(AddOperation {
+                        opstamp,
+                        document,
+                        doc_id: None,
+                    })
                     .await?;
                 opstamp += 1;
             }

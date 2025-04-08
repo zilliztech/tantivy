@@ -1,3 +1,4 @@
+use core::panic;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -31,6 +32,7 @@ use crate::TantivyError;
 /// ```
 #[derive(Debug, Default)]
 pub struct SchemaBuilder {
+    user_specified_doc_id: bool,
     fields: Vec<FieldEntry>,
     fields_map: HashMap<String, Field>,
 }
@@ -205,10 +207,27 @@ impl SchemaBuilder {
         field
     }
 
+    pub fn enable_user_specified_doc_id(&mut self) {
+        self.user_specified_doc_id = true;
+    }
+
     /// Finalize the creation of a `Schema`
     /// This will consume your `SchemaBuilder`
     pub fn build(self) -> Schema {
+        if self.user_specified_doc_id {
+            if let Some(field) = self
+                .fields
+                .iter()
+                .find(|field| field.is_fast() || field.is_stored() || field.has_fieldnorms())
+            {
+                panic!(
+                    "User specified doc id is enabled, field {:?} is not supported",
+                    field
+                );
+            }
+        }
         Schema(Arc::new(InnerSchema {
+            user_specified_doc_id: self.user_specified_doc_id,
             fields: self.fields,
             fields_map: self.fields_map,
         }))
@@ -216,6 +235,7 @@ impl SchemaBuilder {
 }
 #[derive(Debug)]
 struct InnerSchema {
+    user_specified_doc_id: bool,
     fields: Vec<FieldEntry>,
     fields_map: HashMap<String, Field>, // transient
 }
@@ -273,6 +293,11 @@ fn locate_splitting_dots(field_path: &str) -> Vec<usize> {
         }
     }
     splitting_dots_pos
+}
+
+#[derive(Serialize, Deserialize)]
+struct DocIdConfig {
+    user_specified_doc_id: bool,
 }
 
 impl Schema {
@@ -368,15 +393,26 @@ impl Schema {
         }
         Some((field, json_path))
     }
+
+    #[inline]
+    pub fn user_specified_doc_id(&self) -> bool {
+        self.0.user_specified_doc_id
+    }
 }
 
 impl Serialize for Schema {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where S: Serializer {
-        let mut seq = serializer.serialize_seq(Some(self.0.fields.len()))?;
+        let mut seq = serializer.serialize_seq(Some(self.0.fields.len() + 1))?;
+
+        seq.serialize_element(&DocIdConfig {
+            user_specified_doc_id: self.0.user_specified_doc_id,
+        })?;
+
         for e in &self.0.fields {
             seq.serialize_element(e)?;
         }
+
         seq.end()
     }
 }
@@ -384,6 +420,13 @@ impl Serialize for Schema {
 impl<'de> Deserialize<'de> for Schema {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where D: Deserializer<'de> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum SchemaElement {
+            Config(DocIdConfig),
+            Field(FieldEntry),
+        }
+
         struct SchemaVisitor;
 
         impl<'de> Visitor<'de> for SchemaVisitor {
@@ -396,11 +439,25 @@ impl<'de> Deserialize<'de> for Schema {
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
             where A: SeqAccess<'de> {
                 let mut schema = SchemaBuilder {
+                    user_specified_doc_id: false,
                     fields: Vec::with_capacity(seq.size_hint().unwrap_or(0)),
                     fields_map: HashMap::with_capacity(seq.size_hint().unwrap_or(0)),
                 };
 
-                while let Some(value) = seq.next_element()? {
+                // We should consider that schema produced by older version may not contains the
+                // user_specified_doc_id config.
+                if let Some(first_element) = seq.next_element::<SchemaElement>()? {
+                    match first_element {
+                        SchemaElement::Config(config) => {
+                            schema.user_specified_doc_id = config.user_specified_doc_id;
+                        }
+                        SchemaElement::Field(field) => {
+                            schema.add_field(field);
+                        }
+                    }
+                }
+
+                while let Some(value) = seq.next_element::<FieldEntry>()? {
                     schema.add_field(value);
                 }
 
@@ -465,6 +522,9 @@ mod tests {
         let schema = schema_builder.build();
         let schema_json = serde_json::to_string_pretty(&schema).unwrap();
         let expected = r#"[
+  {
+    "user_specified_doc_id": false
+  },
   {
     "name": "title",
     "type": "text",
@@ -836,6 +896,9 @@ mod tests {
 
         let schema_content = r#"[
   {
+    "user_specified_doc_id": false
+  },
+  {
     "name": "text",
     "type": "text",
     "options": {
@@ -868,6 +931,9 @@ mod tests {
         let schema = schema_builder.build();
         let schema_json = serde_json::to_string_pretty(&schema).unwrap();
         let expected = r#"[
+  {
+    "user_specified_doc_id": false
+  },
   {
     "name": "_id",
     "type": "text",
@@ -1018,6 +1084,24 @@ mod tests {
         assert_eq!(
             schema.find_field_with_default("foobar", Some(default)),
             Some((default, "foobar"))
+        );
+    }
+
+    #[test]
+    pub fn test_schema_with_user_specified_doc_id() {
+        let mut schema_builder = Schema::builder();
+        schema_builder.enable_user_specified_doc_id();
+        schema_builder.add_text_field("title", TEXT_WITH_DOC_ID);
+        let schema = schema_builder.build();
+        assert_eq!(schema.user_specified_doc_id(), true);
+
+        let schema_json = serde_json::to_string_pretty(&schema).unwrap();
+
+        let deserialized: Schema = serde_json::from_str(&schema_json).unwrap();
+        assert_eq!(deserialized.user_specified_doc_id(), true);
+        assert_eq!(
+            deserialized.get_field_entry(Field::from_field_id(0)),
+            &FieldEntry::new_text("title".to_string(), TEXT_WITH_DOC_ID)
         );
     }
 }

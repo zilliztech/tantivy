@@ -708,6 +708,12 @@ impl Index {
         }
         Ok(damaged_files)
     }
+
+    /// Returns true if the index has user specified doc id.
+    #[inline]
+    pub fn user_specified_doc_id(&self) -> bool {
+        self.schema.user_specified_doc_id()
+    }
 }
 
 impl fmt::Debug for Index {

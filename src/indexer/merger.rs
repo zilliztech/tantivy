@@ -1,3 +1,4 @@
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use columnar::{
@@ -15,7 +16,7 @@ use crate::fieldnorm::{FieldNormReader, FieldNormReaders, FieldNormsSerializer, 
 use crate::index::{Segment, SegmentComponent, SegmentReader};
 use crate::indexer::doc_id_mapping::{MappingType, SegmentDocIdMapping};
 use crate::indexer::SegmentSerializer;
-use crate::postings::{InvertedIndexSerializer, Postings, SegmentPostings};
+use crate::postings::{FieldSerializer, InvertedIndexSerializer, Postings, SegmentPostings};
 use crate::schema::{value_type_to_column_type, Field, FieldType, Schema};
 use crate::store::StoreWriter;
 use crate::termdict::{TermMerger, TermOrdinal};
@@ -142,6 +143,246 @@ fn extract_fast_field_required_columns(schema: &Schema) -> Vec<(String, ColumnTy
             Some((column_name, column_type))
         })
         .collect()
+}
+
+struct SegmentDocIdMapper<'a> {
+    identity_mapping: bool,
+    doc_id_mapping: &'a [Option<DocId>],
+}
+
+impl SegmentDocIdMapper<'_> {
+    #[inline]
+    fn remapped_doc_id(&self, old_doc_id: DocId) -> Option<DocId> {
+        if self.identity_mapping {
+            return Some(old_doc_id);
+        }
+        self.doc_id_mapping[old_doc_id as usize]
+    }
+}
+
+struct DocIdMapper {
+    identity_mapping: bool,
+    merged_doc_id_map: Vec<Vec<Option<DocId>>>,
+}
+
+impl DocIdMapper {
+    fn new(
+        readers: &[SegmentReader],
+        user_specified_doc_id: bool,
+        doc_id_mapping: &SegmentDocIdMapping,
+    ) -> Self {
+        if !user_specified_doc_id {
+            let mut merged_doc_id_map: Vec<Vec<Option<DocId>>> = readers
+                .iter()
+                .map(|reader| {
+                    let mut segment_local_map = vec![];
+                    segment_local_map.resize(reader.max_doc() as usize, None);
+                    segment_local_map
+                })
+                .collect();
+            for (new_doc_id, old_doc_addr) in doc_id_mapping.iter_old_doc_addrs().enumerate() {
+                let segment_map = &mut merged_doc_id_map[old_doc_addr.segment_ord as usize];
+                segment_map[old_doc_addr.doc_id as usize] = Some(new_doc_id as DocId);
+            }
+
+            Self {
+                identity_mapping: false,
+                merged_doc_id_map,
+            }
+        } else if doc_id_mapping.has_deletes() {
+            // todo: it can be optimized
+            let mut merged_doc_id_map: Vec<Vec<Option<DocId>>> = readers
+                .iter()
+                .map(|reader| {
+                    let mut segment_local_map = vec![];
+                    segment_local_map.resize(reader.max_doc() as usize, None);
+                    segment_local_map
+                })
+                .collect();
+            for old_doc_addr in doc_id_mapping.iter_old_doc_addrs() {
+                let segment_map = &mut merged_doc_id_map[old_doc_addr.segment_ord as usize];
+                segment_map[old_doc_addr.doc_id as usize] = Some(old_doc_addr.doc_id as DocId);
+            }
+
+            Self {
+                identity_mapping: false,
+                merged_doc_id_map,
+            }
+        } else {
+            Self {
+                identity_mapping: true,
+                merged_doc_id_map: vec![],
+            }
+        }
+    }
+
+    #[inline]
+    fn segment_doc_id_mapper(&self, seg_ord: usize) -> SegmentDocIdMapper {
+        SegmentDocIdMapper {
+            identity_mapping: self.identity_mapping,
+            doc_id_mapping: if self.identity_mapping {
+                &[]
+            } else {
+                &self.merged_doc_id_map[seg_ord]
+            },
+        }
+    }
+}
+
+struct PostingEntry<'a> {
+    cur_doc: DocId,
+    id_filter: SegmentDocIdMapper<'a>,
+    postings: SegmentPostings,
+}
+
+impl<'a> PostingEntry<'a> {
+    fn new(
+        id_filter: SegmentDocIdMapper<'a>,
+        mut postings: SegmentPostings,
+    ) -> Option<PostingEntry<'a>> {
+        let mut doc_id = postings.doc();
+        while doc_id != TERMINATED {
+            if let Some(doc_id) = id_filter.remapped_doc_id(doc_id) {
+                return Some(PostingEntry {
+                    cur_doc: doc_id,
+                    id_filter,
+                    postings,
+                });
+            } else {
+                doc_id = postings.advance();
+            }
+        }
+        None
+    }
+
+    fn advance(&mut self) -> DocId {
+        let mut doc_id = self.postings.advance();
+        while doc_id != TERMINATED {
+            if let Some(doc_id) = self.id_filter.remapped_doc_id(doc_id) {
+                self.cur_doc = doc_id;
+                return doc_id;
+            } else {
+                doc_id = self.postings.advance();
+            }
+        }
+        TERMINATED
+    }
+}
+
+impl Ord for PostingEntry<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.cur_doc.cmp(&other.cur_doc)
+    }
+}
+impl PartialOrd for PostingEntry<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for PostingEntry<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cur_doc == other.cur_doc
+    }
+}
+impl Eq for PostingEntry<'_> {}
+
+#[allow(clippy::too_many_arguments)]
+fn serialize_merged_terms_for_user_id(
+    term_bytes: &[u8],
+    field_serializer: &mut FieldSerializer,
+    has_term_freq: bool,
+    total_doc_freq: u32,
+    segment_postings_containing_the_term: &mut Vec<(usize, SegmentPostings)>,
+    positions_buffer: &mut Vec<u32>,
+    delta_computer: &mut DeltaComputer,
+    doc_id_mapper: &DocIdMapper,
+) -> crate::Result<()> {
+    field_serializer.new_term(term_bytes, total_doc_freq, has_term_freq)?;
+
+    let mut heap = BinaryHeap::new();
+    for (segment_ord, postings) in segment_postings_containing_the_term.drain(..) {
+        // For user specified doc id, the mapping is just the identity. But we need it here
+        // to filter docs that are deleted.
+        let segment_doc_id_mapper = doc_id_mapper.segment_doc_id_mapper(segment_ord);
+        if let Some(posting_entry) = PostingEntry::new(segment_doc_id_mapper, postings) {
+            heap.push(posting_entry);
+        }
+    }
+
+    while let Some(mut next) = heap.pop() {
+        let doc_id = next.cur_doc;
+        let term_freq = if has_term_freq {
+            next.postings.positions(positions_buffer);
+            next.postings.term_freq()
+        } else {
+            // The positions_buffer may contain positions from the previous term
+            // Existence of positions depend on the value type in JSON fields.
+            // https://github.com/quickwit-oss/tantivy/issues/2283
+            positions_buffer.clear();
+            0u32
+        };
+
+        let delta_positions = delta_computer.compute_delta(positions_buffer);
+        field_serializer.write_doc(doc_id, term_freq, delta_positions);
+
+        if next.advance() != TERMINATED {
+            heap.push(next);
+        }
+    }
+
+    // closing the term.
+    field_serializer.close_term()?;
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serialize_merged_terms_for_default_id(
+    term_bytes: &[u8],
+    field_serializer: &mut FieldSerializer,
+    has_term_freq: bool,
+    total_doc_freq: u32,
+    segment_postings_containing_the_term: &mut Vec<(usize, SegmentPostings)>,
+    positions_buffer: &mut Vec<u32>,
+    delta_computer: &mut DeltaComputer,
+    doc_id_mapper: &DocIdMapper,
+) -> crate::Result<()> {
+    field_serializer.new_term(term_bytes, total_doc_freq, has_term_freq)?;
+
+    // We can now serialize this postings, by pushing each document to the
+    // postings serializer.
+    for (segment_ord, mut segment_postings) in segment_postings_containing_the_term.drain(..) {
+        let old_to_new_doc_id = &doc_id_mapper.segment_doc_id_mapper(segment_ord);
+
+        let mut doc = segment_postings.doc();
+        while doc != TERMINATED {
+            // deleted doc are skipped as they do not have a `remapped_doc_id`.
+            if let Some(remapped_doc_id) = old_to_new_doc_id.remapped_doc_id(doc) {
+                // we make sure to only write the term if
+                // there is at least one document.
+                let term_freq = if has_term_freq {
+                    segment_postings.positions(positions_buffer);
+                    segment_postings.term_freq()
+                } else {
+                    // The positions_buffer may contain positions from the previous term
+                    // Existence of positions depend on the value type in JSON fields.
+                    // https://github.com/quickwit-oss/tantivy/issues/2283
+                    positions_buffer.clear();
+                    0u32
+                };
+
+                let delta_positions = delta_computer.compute_delta(positions_buffer);
+                field_serializer.write_doc(remapped_doc_id, term_freq, delta_positions);
+            }
+
+            doc = segment_postings.advance();
+        }
+    }
+
+    // closing the term.
+    field_serializer.close_term()?;
+
+    Ok(())
 }
 
 impl IndexMerger {
@@ -280,6 +521,7 @@ impl IndexMerger {
             mapping,
             mapping_type,
             alive_bitsets,
+            has_deletes,
         ))
     }
 
@@ -314,19 +556,11 @@ impl IndexMerger {
 
         // map from segment doc ids to the resulting merged segment doc id.
 
-        let mut merged_doc_id_map: Vec<Vec<Option<DocId>>> = self
-            .readers
-            .iter()
-            .map(|reader| {
-                let mut segment_local_map = vec![];
-                segment_local_map.resize(reader.max_doc() as usize, None);
-                segment_local_map
-            })
-            .collect();
-        for (new_doc_id, old_doc_addr) in doc_id_mapping.iter_old_doc_addrs().enumerate() {
-            let segment_map = &mut merged_doc_id_map[old_doc_addr.segment_ord as usize];
-            segment_map[old_doc_addr.doc_id as usize] = Some(new_doc_id as DocId);
-        }
+        let doc_id_mapper = DocIdMapper::new(
+            &self.readers,
+            self.schema.user_specified_doc_id(),
+            doc_id_mapping,
+        );
 
         // Note that the total number of tokens is not exact.
         // It is only used as a parameter in the BM25 formula.
@@ -425,41 +659,29 @@ impl IndexMerger {
                 has_term_freq
             };
 
-            field_serializer.new_term(term_bytes, total_doc_freq, has_term_freq)?;
-
-            // We can now serialize this postings, by pushing each document to the
-            // postings serializer.
-            for (segment_ord, mut segment_postings) in
-                segment_postings_containing_the_term.drain(..)
-            {
-                let old_to_new_doc_id = &merged_doc_id_map[segment_ord];
-
-                let mut doc = segment_postings.doc();
-                while doc != TERMINATED {
-                    // deleted doc are skipped as they do not have a `remapped_doc_id`.
-                    if let Some(remapped_doc_id) = old_to_new_doc_id[doc as usize] {
-                        // we make sure to only write the term if
-                        // there is at least one document.
-                        let term_freq = if has_term_freq {
-                            segment_postings.positions(&mut positions_buffer);
-                            segment_postings.term_freq()
-                        } else {
-                            // The positions_buffer may contain positions from the previous term
-                            // Existence of positions depend on the value type in JSON fields.
-                            // https://github.com/quickwit-oss/tantivy/issues/2283
-                            positions_buffer.clear();
-                            0u32
-                        };
-
-                        let delta_positions = delta_computer.compute_delta(&positions_buffer);
-                        field_serializer.write_doc(remapped_doc_id, term_freq, delta_positions);
-                    }
-
-                    doc = segment_postings.advance();
-                }
+            if self.schema.user_specified_doc_id() {
+                serialize_merged_terms_for_user_id(
+                    term_bytes,
+                    &mut field_serializer,
+                    has_term_freq,
+                    total_doc_freq,
+                    &mut segment_postings_containing_the_term,
+                    &mut positions_buffer,
+                    &mut delta_computer,
+                    &doc_id_mapper,
+                )?;
+            } else {
+                serialize_merged_terms_for_default_id(
+                    term_bytes,
+                    &mut field_serializer,
+                    has_term_freq,
+                    total_doc_freq,
+                    &mut segment_postings_containing_the_term,
+                    &mut positions_buffer,
+                    &mut delta_computer,
+                    &doc_id_mapper,
+                )?;
             }
-            // closing the term.
-            field_serializer.close_term()?;
         }
         field_serializer.close()?;
         Ok(())
@@ -529,6 +751,10 @@ impl IndexMerger {
         let doc_id_mapping = self.get_doc_id_from_concatenated_data()?;
         debug!("write-fieldnorms");
         if let Some(fieldnorms_serializer) = serializer.extract_fieldnorms_serializer() {
+            assert!(
+                !self.schema.user_specified_doc_id()
+                    || FieldNormsWriter::fields_with_fieldnorm(&self.schema).is_empty()
+            );
             self.write_fieldnorms(fieldnorms_serializer, &doc_id_mapping)?;
         }
         debug!("write-postings");
@@ -565,13 +791,14 @@ mod tests {
     use crate::collector::tests::{
         BytesFastFieldTestCollector, FastFieldTestCollector, TEST_COLLECTOR_WITH_SCORE,
     };
-    use crate::collector::{Count, FacetCollector};
+    use crate::collector::{Count, DocSetCollector, FacetCollector};
     use crate::index::{Index, SegmentId};
+    use crate::indexer::index_writer::MEMORY_BUDGET_NUM_BYTES_MIN;
     use crate::indexer::NoMergePolicy;
     use crate::query::{AllQuery, BooleanQuery, EnableScoring, Scorer, TermQuery};
     use crate::schema::{
         Facet, FacetOptions, IndexRecordOption, NumericOptions, TantivyDocument, Term,
-        TextFieldIndexing, Value, INDEXED, TEXT,
+        TextFieldIndexing, Value, INDEXED, TEXT, TEXT_WITH_DOC_ID,
     };
     use crate::time::OffsetDateTime;
     use crate::{
@@ -1576,5 +1803,120 @@ mod tests {
         // this is the first time I write a unit test for a constant.
         assert!(((super::MAX_DOC_LIMIT - 1) as i32) >= 0);
         assert!((super::MAX_DOC_LIMIT as i32) < 0);
+    }
+
+    #[test]
+    fn test_merge_with_user_specified_doc_id() {
+        let mut builder = schema::SchemaBuilder::new();
+        let text = builder.add_text_field("text", TEXT_WITH_DOC_ID);
+        builder.enable_user_specified_doc_id();
+        let index = Index::create_in_ram(builder.build());
+        let mut writer = index
+            .writer_with_num_threads(4, 4 * MEMORY_BUDGET_NUM_BYTES_MIN)
+            .unwrap();
+
+        for i in 0..1000 {
+            let k = format!("key{:04}", i);
+            let _ = writer
+                .add_document_with_doc_id(
+                    i,
+                    doc!(
+                        text => k,
+                    ),
+                )
+                .unwrap();
+        }
+
+        writer.commit().unwrap();
+
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        for i in 0..1000 {
+            let k = format!("key{:04}", i);
+            let term = Term::from_field_text(text, &k);
+            let term_query = TermQuery::new(term, IndexRecordOption::Basic);
+            let doc_set = searcher.search(&term_query, &DocSetCollector).unwrap();
+            assert_eq!(doc_set.len(), 1);
+            doc_set.iter().for_each(|doc| {
+                assert_eq!(doc.doc_id, i);
+            });
+        }
+
+        let segment_ids: Vec<SegmentId> = searcher
+            .segment_readers()
+            .iter()
+            .map(|reader| reader.segment_id())
+            .collect();
+        writer.merge(&segment_ids[..]).wait().unwrap();
+
+        reader.reload().unwrap();
+        let searcher = reader.searcher();
+        for i in 0..1000 {
+            let k = format!("key{:04}", i);
+            let term = Term::from_field_text(text, &k);
+            let term_query = TermQuery::new(term, IndexRecordOption::Basic);
+            let doc_set = searcher.search(&term_query, &DocSetCollector).unwrap();
+            assert_eq!(doc_set.len(), 1);
+            doc_set.iter().for_each(|doc| {
+                assert_eq!(doc.doc_id, i);
+            });
+        }
+    }
+
+    #[test]
+    fn test_merge_with_user_specified_doc_id_with_delete() {
+        let mut builder = schema::SchemaBuilder::new();
+        let text = builder.add_text_field("text", TEXT_WITH_DOC_ID);
+        builder.enable_user_specified_doc_id();
+        let index = Index::create_in_ram(builder.build());
+        let mut writer = index
+            .writer_with_num_threads(4, 4 * MEMORY_BUDGET_NUM_BYTES_MIN)
+            .unwrap();
+
+        for i in 0..1000 {
+            let k = format!("key{:04}", i);
+            let _ = writer
+                .add_document_with_doc_id(
+                    i,
+                    doc!(
+                        text => k,
+                    ),
+                )
+                .unwrap();
+        }
+
+        for i in (0..1000).step_by(3) {
+            let k = format!("key{:04}", i);
+            let term = Term::from_field_text(text, &k);
+            writer.delete_term(term);
+        }
+
+        writer.commit().unwrap();
+
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let segment_ids: Vec<SegmentId> = searcher
+            .segment_readers()
+            .iter()
+            .map(|reader| reader.segment_id())
+            .collect();
+        writer.merge(&segment_ids[..]).wait().unwrap();
+
+        reader.reload().unwrap();
+        let searcher = reader.searcher();
+        let mut vec = vec![];
+        for i in 0..1000 {
+            let k = format!("key{:04}", i);
+            let term = Term::from_field_text(text, &k);
+            let term_query = TermQuery::new(term, IndexRecordOption::Basic);
+            let doc_set = searcher.search(&term_query, &DocSetCollector).unwrap();
+            assert!(doc_set.len() <= 1);
+            vec.extend(doc_set.iter().map(|d| {
+                assert!(d.doc_id % 3 != 0);
+                d.doc_id
+            }));
+        }
+
+        assert_eq!(vec.len(), 666);
     }
 }
