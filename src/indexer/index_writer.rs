@@ -59,9 +59,8 @@ pub struct IndexWriterOptions {
     /// The number of indexer workers to use.
     num_indexing_worker: usize,
     #[builder(default = 4)]
-    /// Defines the number of merger workers to use.
-    // todo(SpadeA): we should use this to limit the running merge operations
-    num_merge_worker: usize,
+    /// Defines how many merges that can be scheduled to run concurrently.
+    running_merge_limit: usize,
 }
 
 #[derive(Clone, bon::Builder)]
@@ -261,7 +260,7 @@ async fn index_documents<D: Document>(
     meta.untrack_temp_docstore();
     // update segment_updater inventory to remove tempstore
     let segment_entry = SegmentEntry::new(meta, delete_cursor, alive_bitset_opt);
-    segment_updater.schedule_add_segment(segment_entry).wait()?;
+    segment_updater.schedule_add_segment(segment_entry).await?;
     Ok(())
 }
 
@@ -385,7 +384,7 @@ impl<D: Document> IndexWriter<D> {
             index.clone(),
             stamper.clone(),
             &delete_queue.cursor(),
-            options.num_merge_worker,
+            options.running_merge_limit,
         )?;
 
         let mut index_writer = Self {

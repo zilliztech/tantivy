@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use rayon::ThreadPool;
+use tokio::sync::Semaphore;
 
 use super::pool;
 use super::segment_manager::SegmentManager;
@@ -265,6 +266,8 @@ pub(crate) struct InnerSegmentUpdater {
     killed: AtomicBool,
     stamper: Stamper,
     merge_operations: MergeOperationInventory,
+
+    semaphore: Arc<Semaphore>,
 }
 
 impl SegmentUpdater {
@@ -272,7 +275,7 @@ impl SegmentUpdater {
         index: Index,
         stamper: Stamper,
         delete_cursor: &DeleteCursor,
-        _num_merge_threads: usize,
+        running_merge_limit: usize,
     ) -> crate::Result<SegmentUpdater> {
         let segments = index.searchable_segment_metas()?;
         let segment_manager = SegmentManager::from_segments(segments, delete_cursor);
@@ -286,6 +289,7 @@ impl SegmentUpdater {
             killed: AtomicBool::new(false),
             stamper,
             merge_operations: Default::default(),
+            semaphore: Arc::new(Semaphore::new(running_merge_limit)),
         })))
     }
 
@@ -478,12 +482,15 @@ impl SegmentUpdater {
             }
         };
 
-        info!("Starting merge  - {:?}", merge_operation.segment_ids());
-
         let (scheduled_result, merging_future_send) =
             FutureResult::create("Merge operation failed.");
+        let semaphore = self.semaphore.clone();
 
         get_tokio_merger_worker_pool().spawn(async move {
+            let _guard = semaphore.acquire().await.unwrap();
+
+            info!("Starting merge  - {:?}", merge_operation.segment_ids());
+
             // The fact that `merge_operation` is moved here is important.
             // Its lifetime is used to track how many merging thread are currently running,
             // as well as which segment is currently in merge and therefore should not be
