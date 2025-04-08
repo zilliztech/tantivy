@@ -357,7 +357,7 @@ impl SegmentWriter {
     /// Indexes a new document
     ///
     /// As a user, you should rather use `IndexWriter`'s add_document.
-    pub async fn add_document_with_default_id<D: Document>(
+    async fn add_document_with_default_id<D: Document>(
         &mut self,
         add_operation: AddOperation<D>,
     ) -> crate::Result<()> {
@@ -382,7 +382,7 @@ impl SegmentWriter {
     /// Indexes a new document with a given doc_id
     ///
     /// In this case, we must not have field with fast field as well as stored.
-    pub async fn add_document_with_specified_id<D: Document>(
+    async fn add_document_with_specified_id<D: Document>(
         &mut self,
         add_operation: AddOperation<D>,
     ) -> crate::Result<()> {

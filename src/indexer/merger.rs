@@ -189,31 +189,29 @@ impl DocIdMapper {
                 identity_mapping: false,
                 merged_doc_id_map,
             }
-        } else {
-            if doc_id_mapping.has_deletes() {
-                // todo: it can be optimized
-                let mut merged_doc_id_map: Vec<Vec<Option<DocId>>> = readers
-                    .iter()
-                    .map(|reader| {
-                        let mut segment_local_map = vec![];
-                        segment_local_map.resize(reader.max_doc() as usize, None);
-                        segment_local_map
-                    })
-                    .collect();
-                for old_doc_addr in doc_id_mapping.iter_old_doc_addrs() {
-                    let segment_map = &mut merged_doc_id_map[old_doc_addr.segment_ord as usize];
-                    segment_map[old_doc_addr.doc_id as usize] = Some(old_doc_addr.doc_id as DocId);
-                }
+        } else if doc_id_mapping.has_deletes() {
+            // todo: it can be optimized
+            let mut merged_doc_id_map: Vec<Vec<Option<DocId>>> = readers
+                .iter()
+                .map(|reader| {
+                    let mut segment_local_map = vec![];
+                    segment_local_map.resize(reader.max_doc() as usize, None);
+                    segment_local_map
+                })
+                .collect();
+            for old_doc_addr in doc_id_mapping.iter_old_doc_addrs() {
+                let segment_map = &mut merged_doc_id_map[old_doc_addr.segment_ord as usize];
+                segment_map[old_doc_addr.doc_id as usize] = Some(old_doc_addr.doc_id as DocId);
+            }
 
-                Self {
-                    identity_mapping: false,
-                    merged_doc_id_map,
-                }
-            } else {
-                Self {
-                    identity_mapping: true,
-                    merged_doc_id_map: vec![],
-                }
+            Self {
+                identity_mapping: false,
+                merged_doc_id_map,
+            }
+        } else {
+            Self {
+                identity_mapping: true,
+                merged_doc_id_map: vec![],
             }
         }
     }
@@ -288,6 +286,7 @@ impl PartialEq for PostingEntry<'_> {
 }
 impl Eq for PostingEntry<'_> {}
 
+#[allow(clippy::too_many_arguments)]
 fn serialize_merged_terms_for_user_id(
     term_bytes: &[u8],
     field_serializer: &mut FieldSerializer,
@@ -323,7 +322,7 @@ fn serialize_merged_terms_for_user_id(
             0u32
         };
 
-        let delta_positions = delta_computer.compute_delta(&positions_buffer);
+        let delta_positions = delta_computer.compute_delta(positions_buffer);
         field_serializer.write_doc(doc_id, term_freq, delta_positions);
 
         if next.advance() != TERMINATED {
@@ -337,6 +336,7 @@ fn serialize_merged_terms_for_user_id(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serialize_merged_terms_for_default_id(
     term_bytes: &[u8],
     field_serializer: &mut FieldSerializer,
@@ -371,7 +371,7 @@ fn serialize_merged_terms_for_default_id(
                     0u32
                 };
 
-                let delta_positions = delta_computer.compute_delta(&positions_buffer);
+                let delta_positions = delta_computer.compute_delta(positions_buffer);
                 field_serializer.write_doc(remapped_doc_id, term_freq, delta_positions);
             }
 

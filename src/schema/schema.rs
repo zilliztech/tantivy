@@ -1,3 +1,4 @@
+use core::panic;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -212,19 +213,17 @@ impl SchemaBuilder {
 
     /// Finalize the creation of a `Schema`
     /// This will consume your `SchemaBuilder`
-    pub fn build(mut self) -> Schema {
+    pub fn build(self) -> Schema {
         if self.user_specified_doc_id {
             if let Some(field) = self
                 .fields
                 .iter()
                 .find(|field| field.is_fast() || field.is_stored() || field.has_fieldnorms())
             {
-                warn!(
-                    "User specified doc id is enabled, field {:?} is not supported; Forbacking to \
-                     default doc id",
+                panic!(
+                    "User specified doc id is enabled, field {:?} is not supported",
                     field
                 );
-                self.user_specified_doc_id = false;
             }
         }
         Schema(Arc::new(InnerSchema {
@@ -1090,27 +1089,6 @@ mod tests {
 
     #[test]
     pub fn test_schema_with_user_specified_doc_id() {
-        let mut schema_builder = Schema::builder();
-        schema_builder.enable_user_specified_doc_id();
-        schema_builder.add_text_field("title", TEXT);
-        let schema = schema_builder.build();
-        // TEXT enables fieldnorms, so the schema does not support user_specified_doc_id
-        assert_eq!(schema.user_specified_doc_id(), false);
-
-        let mut schema_builder = Schema::builder();
-        schema_builder.enable_user_specified_doc_id();
-        schema_builder.add_text_field("title", TEXT_WITH_DOC_ID);
-        schema_builder.add_i64_field("i64", FAST);
-        let schema = schema_builder.build();
-        assert_eq!(schema.user_specified_doc_id(), false);
-
-        let mut schema_builder = Schema::builder();
-        schema_builder.enable_user_specified_doc_id();
-        schema_builder.add_text_field("title", TEXT_WITH_DOC_ID);
-        schema_builder.add_i64_field("i64", STORED);
-        let schema = schema_builder.build();
-        assert_eq!(schema.user_specified_doc_id(), false);
-
         let mut schema_builder = Schema::builder();
         schema_builder.enable_user_specified_doc_id();
         schema_builder.add_text_field("title", TEXT_WITH_DOC_ID);
