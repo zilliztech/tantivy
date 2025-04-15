@@ -2,13 +2,14 @@ use std::io::BufRead;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-use std::thread::JoinHandle;
 use std::time::Duration;
-use std::{fs, io, thread};
+use std::{fs, io};
 
 use crc32fast::Hasher;
+use tokio::task::JoinHandle;
 
 use crate::directory::{WatchCallback, WatchCallbackList, WatchHandle};
+use crate::indexer::get_tokio_file_watcher_worker_pool;
 
 const POLLING_INTERVAL: Duration = Duration::from_millis(if cfg!(test) { 1 } else { 500 });
 
@@ -18,7 +19,7 @@ pub struct FileWatcher {
     callbacks: Arc<WatchCallbackList>,
     state: Arc<AtomicUsize>, // 0: new, 1: runnable, 2: terminated
     watch_handle: RwLock<Option<JoinHandle<()>>>,
-    wakeup_channel: RwLock<Option<std::sync::mpsc::Sender<()>>>,
+    wakeup_channel: RwLock<Option<async_channel::Sender<()>>>,
 }
 
 impl FileWatcher {
@@ -45,34 +46,34 @@ impl FileWatcher {
         let callbacks = self.callbacks.clone();
         let state = self.state.clone();
 
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let (tx, rx) = async_channel::bounded(5);
         self.wakeup_channel.write().unwrap().replace(tx);
-        self.watch_handle.write().unwrap().replace(
-            thread::Builder::new()
-                .name("thread-tantivy-meta-file-watcher".to_string())
-                .spawn(move || {
-                    let mut current_checksum_opt = None;
-
-                    while state.load(Ordering::SeqCst) == 1 {
-                        if let Ok(checksum) = FileWatcher::compute_checksum(&path) {
-                            let metafile_has_changed = current_checksum_opt
-                                .map(|current_checksum| current_checksum != checksum)
-                                .unwrap_or(true);
-                            if metafile_has_changed {
-                                info!("Meta file {:?} was modified", path);
-                                current_checksum_opt = Some(checksum);
-                                // We actually ignore callbacks failing here.
-                                // We just wait for the end of their execution.
-                                let _ = callbacks.broadcast().wait();
-                            }
-                        }
-
-                        // Use a channel to allow early wake up from sleep
-                        let _ = rx.recv_timeout(POLLING_INTERVAL);
+        let task = async move {
+            let mut current_checksum_opt = None;
+            while state.load(Ordering::SeqCst) == 1 {
+                if let Ok(checksum) = FileWatcher::compute_checksum(&path) {
+                    let metafile_has_changed = current_checksum_opt
+                        .map(|current_checksum| current_checksum != checksum)
+                        .unwrap_or(true);
+                    if metafile_has_changed {
+                        info!("Meta file {:?} was modified", path);
+                        current_checksum_opt = Some(checksum);
+                        // We actually ignore callbacks failing here.
+                        // We just wait for the end of their execution.
+                        let _ = callbacks.broadcast().wait();
                     }
-                })
-                .expect("Failed to spawn meta file watcher thread"),
-        );
+                }
+
+                tokio::select! {
+                    _ = tokio::time::sleep(POLLING_INTERVAL) => {},
+                    _ = rx.recv() => {
+                        // Early wake up from sleep
+                    }
+                }
+            }
+        };
+        let watch_handle = get_tokio_file_watcher_worker_pool().spawn(task);
+        self.watch_handle.write().unwrap().replace(watch_handle);
     }
 
     pub fn watch(&self, callback: WatchCallback) -> WatchHandle {
@@ -103,9 +104,7 @@ impl FileWatcher {
         self.state.store(2, Ordering::SeqCst);
         if let Some(handle) = self.watch_handle.write().unwrap().take() {
             let _ = self.wakeup_channel.write().unwrap().take();
-            handle
-                .join()
-                .expect("Failed to join meta file watcher thread");
+            handle.abort();
             info!("Meta file watcher thread joined");
         }
     }
@@ -120,7 +119,7 @@ impl Drop for FileWatcher {
 #[cfg(test)]
 mod tests {
 
-    use std::mem;
+    use std::{mem, thread};
 
     use super::*;
     use crate::directory::mmap_directory::atomic_write;
