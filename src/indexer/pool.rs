@@ -64,23 +64,41 @@ pub(crate) fn init_pool(singleton_options: SingletonIndexWriterOptions) {
 // It must be called after [`init_pool`].
 #[inline]
 pub fn get_tokio_indexing_worker_pool() -> &'static runtime::Runtime {
-    TOKIO_INDEXING_WORKER_POOL.get().unwrap()
+    TOKIO_INDEXING_WORKER_POOL.get().unwrap_or_else(|| {
+        let config = SingletonIndexWriterOptions::default();
+        init_pool(config);
+        TOKIO_INDEXING_WORKER_POOL.get().unwrap()
+    })
 }
 
 // It must be called after [`init_pool`].
 #[inline]
 pub fn get_tokio_merger_worker_pool() -> &'static runtime::Runtime {
-    TOKIO_MERGER_WORKER_POOL.get().unwrap()
+    TOKIO_MERGER_WORKER_POOL.get().unwrap_or_else(|| {
+        let config = SingletonIndexWriterOptions::default();
+        init_pool(config);
+        TOKIO_MERGER_WORKER_POOL.get().unwrap()
+    })
 }
 
 // It must be called after [`init_pool`].
 #[inline]
 pub fn get_tokio_docstore_compress_worker_pool() -> &'static runtime::Runtime {
-    TOKIO_DOCSTORE_COMPRESS_WORKER_POOL.get().unwrap()
+    TOKIO_DOCSTORE_COMPRESS_WORKER_POOL
+        .get()
+        .unwrap_or_else(|| {
+            let config = SingletonIndexWriterOptions::default();
+            init_pool(config);
+            TOKIO_DOCSTORE_COMPRESS_WORKER_POOL.get().unwrap()
+        })
 }
 
 // It must be called after [`init_pool`].
 #[inline]
 pub fn get_segment_updater_pool() -> &'static ThreadPool {
-    SEGMENT_UPDATER_POOL.get().unwrap()
+    SEGMENT_UPDATER_POOL.get().unwrap_or_else(|| {
+        let config = SingletonIndexWriterOptions::default();
+        init_pool(config);
+        SEGMENT_UPDATER_POOL.get().unwrap()
+    })
 }
