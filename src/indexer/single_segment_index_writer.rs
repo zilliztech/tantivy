@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use tokio::task::JoinHandle;
 
-use super::index_writer::error_in_index_worker_thread;
-use super::pool::get_tokio_indexing_worker_pool;
+use super::index_writer::{error_in_index_worker_thread, SingletonIndexWriterOptions};
+use super::pool::{get_tokio_indexing_worker_pool, init_pool};
 use crate::indexer::operation::AddOperation;
 use crate::indexer::segment_updater::save_metas;
 use crate::indexer::SegmentWriter;
@@ -21,6 +21,9 @@ pub struct SingleSegmentIndexWriter<D: Document = TantivyDocument> {
 
 impl<D: Document> SingleSegmentIndexWriter<D> {
     pub fn new(index: Index, mem_budget: usize) -> crate::Result<Self> {
+        let config = SingletonIndexWriterOptions::default();
+        init_pool(config);
+
         let segment = index.new_segment();
         let mut segment_writer = SegmentWriter::for_segment(mem_budget, segment.clone())?;
         let (tx, rx) = async_channel::unbounded();

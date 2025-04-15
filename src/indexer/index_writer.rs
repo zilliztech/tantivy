@@ -2801,4 +2801,42 @@ mod tests {
             });
         }
     }
+
+    #[test]
+    fn test_add_documents_with_doc_id_multi_commit() {
+        let mut builder = schema::SchemaBuilder::new();
+        let text = builder.add_text_field("text", TEXT_WITH_DOC_ID);
+        builder.enable_user_specified_doc_id();
+        let index = Index::create_in_ram(builder.build());
+        let mut writer = index
+            .writer_with_num_threads(4, 4 * MEMORY_BUDGET_NUM_BYTES_MIN)
+            .unwrap();
+
+        let mut count = 0;
+        for i in 0..107 {
+            let mut documents = vec![];
+            for _ in 0..10 {
+                let k = format!("key{:04}", count);
+                count += 1;
+                documents.push(doc!(
+                    text => k,
+                ));
+            }
+            writer.add_documents_with_doc_id(i * 10, documents).unwrap();
+
+            if i % 10 == 0 {
+                writer.commit().unwrap();
+            }
+        }
+
+        writer.commit().unwrap();
+
+        let metas = index.searchable_segment_metas().unwrap();
+        let mut sum: u32 = 0;
+        for meta in metas {
+            sum = std::cmp::max(sum, meta.max_doc());
+        }
+
+        assert_eq!(count, sum as usize);
+    }
 }

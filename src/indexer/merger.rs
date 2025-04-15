@@ -417,7 +417,15 @@ impl IndexMerger {
             }
         }
 
-        let max_doc = readers.iter().map(|reader| reader.num_docs()).sum();
+        let max_doc = if schema.user_specified_doc_id() {
+            readers
+                .iter()
+                .map(|reader| reader.max_doc())
+                .max()
+                .unwrap_or_default()
+        } else {
+            readers.iter().map(|reader| reader.num_docs()).sum()
+        };
         // sort segments by their natural sort setting
         if max_doc >= MAX_DOC_LIMIT {
             let err_msg = format!(
