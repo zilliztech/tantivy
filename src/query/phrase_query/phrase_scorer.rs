@@ -1,11 +1,29 @@
 use std::cmp::Ordering;
 
+use smallvec::SmallVec;
+
 use crate::docset::{DocSet, TERMINATED};
 use crate::fieldnorm::FieldNormReader;
 use crate::postings::Postings;
 use crate::query::bm25::Bm25Weight;
 use crate::query::{Intersection, Scorer};
 use crate::{DocId, Score};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PositionSpan {
+    left: u32,
+    right: u32,
+}
+
+impl PositionSpan {
+    fn distance(&self) -> u32 {
+        self.right - self.left
+    }
+
+    fn non_overlap(&self, other: &PositionSpan) -> bool {
+        self.right < other.left || self.left > other.right
+    }
+}
 
 struct PostingsWithOffset<TPostings> {
     offset: u32,
@@ -52,9 +70,9 @@ pub struct PhraseScorer<TPostings: Postings> {
     fieldnorm_reader: FieldNormReader,
     similarity_weight_opt: Option<Bm25Weight>,
     slop: u32,
-    left_slops: Vec<u8>,
-    positions_buffer: Vec<u32>,
-    slops_buffer: Vec<u8>,
+
+    current_spans: Vec<PositionSpan>,
+    spans_buffer: Vec<PositionSpan>,
 }
 
 /// Returns true if and only if the two sorted arrays contain a common element
@@ -190,158 +208,126 @@ fn intersection_count_with_slop(
     count
 }
 
-fn intersection_exists_with_slop(
-    left_positions: &[u32],
-    right_positions: &[u32],
-    slop: u32,
+/// Identifies matching spans within a positional slop constraint and builds expanded position
+/// spans.
+///
+/// This function analyzes positional relationships between existing position spans
+/// (`current_spans`) and new positions (`next_positions`), identifying matches that fall within the
+/// allowed distance (`max_slop`). For each existing span, it finds the best matching position based
+/// on minimum distance, and constructs new spans that potentially expand the coverage.
+///
+/// Return the number of non-overlapping spans found during matching
+fn intersection_count_with_slop_with_spans(
+    current_spans: &mut Vec<PositionSpan>,
+    next_positions: &[u32],
+    max_slop: u32,
+    spans_buffer: &mut Vec<PositionSpan>,
+) -> u32 {
+    let mut count = 0;
+    let mut start_index = 0;
+    for prev_qualified in current_spans.iter() {
+        let mut best_match = SmallVec::<[PositionSpan; 4]>::new();
+        let mut best_match_distance = u32::MAX;
+        let mut record_no_expansion = false;
+        for idx in start_index..next_positions.len() {
+            let pos = next_positions[idx];
+            if pos < prev_qualified.left {
+                start_index = idx;
+                let distance = prev_qualified.right - pos;
+                if distance <= max_slop {
+                    if distance < best_match_distance {
+                        best_match_distance = distance;
+                        best_match.clear();
+                        best_match.push(PositionSpan {
+                            left: pos,
+                            right: prev_qualified.right,
+                        });
+                    } else if distance == best_match_distance {
+                        // Record the span if the distance is the same as the best match distance
+                        // Ex: [8] and [7, 9] with slop 1
+                        // we should have [{7, 8}] as well as [{8, 9}]
+                        best_match.push(PositionSpan {
+                            left: pos,
+                            right: prev_qualified.right,
+                        });
+                    }
+                }
+            } else if pos > prev_qualified.right {
+                let distance = pos - prev_qualified.left;
+                if distance <= max_slop {
+                    if distance < best_match_distance {
+                        best_match_distance = distance;
+                        best_match.clear();
+                        best_match.push(PositionSpan {
+                            left: prev_qualified.left,
+                            right: pos,
+                        });
+                    } else if distance == best_match_distance {
+                        best_match.push(PositionSpan {
+                            left: prev_qualified.left,
+                            right: pos,
+                        });
+                    }
+                } else {
+                    break;
+                }
+            } else {
+                if pos == prev_qualified.left {
+                    start_index = idx;
+                }
+                best_match_distance = prev_qualified.distance();
+                if !record_no_expansion {
+                    best_match.clear();
+                    best_match.push(*prev_qualified);
+                    record_no_expansion = true;
+                }
+            }
+        }
+        if !best_match.is_empty() {
+            for span in best_match.into_iter() {
+                // only inc count if the new span is not overlap with the last span
+                if spans_buffer
+                    .last()
+                    .map_or(true, |last: &PositionSpan| last.non_overlap(&span))
+                {
+                    count += 1;
+                }
+                spans_buffer.push(span);
+            }
+        }
+    }
+    std::mem::swap(current_spans, spans_buffer);
+    spans_buffer.clear();
+    count
+}
+
+fn intersection_exists_with_slop_with_spans(
+    current_spans: &[PositionSpan],
+    next_positions: &[u32],
+    max_slop: u32,
 ) -> bool {
-    let mut left_index = 0;
-    let mut right_index = 0;
-    let left_len = left_positions.len();
-    let right_len = right_positions.len();
-    while left_index < left_len && right_index < right_len {
-        let left_val = left_positions[left_index];
-        let right_val = right_positions[right_index];
-        let distance = left_val.abs_diff(right_val);
-        if distance <= slop {
-            return true;
-        } else if left_val < right_val {
-            left_index += 1;
+    let mut span_index = 0;
+    let mut positions_index = 0;
+    while span_index < current_spans.len() && positions_index < next_positions.len() {
+        let span = current_spans[span_index];
+        let position = next_positions[positions_index];
+        if position < span.left {
+            let distance = span.right - position;
+            if distance <= max_slop {
+                return true;
+            }
+            positions_index += 1;
+        } else if position > span.right {
+            let distance = position - span.left;
+            if distance <= max_slop {
+                return true;
+            }
+            span_index += 1;
         } else {
-            right_index += 1;
+            return true;
         }
     }
     false
-}
-
-/// Intersection variant for multi term searches that keeps track of slop so far.
-///
-/// In contrast to the regular algorithm this solves some issues:
-/// - Keep track of the slop so far. Slop is a budget that is spent on the distance between terms.
-/// - When encountering a match between two positions, which position is the best match is unclear
-///   and depends on intersections afterwards, therefore this algorithm keeps left and right as
-///   matches, but only counts one.
-///
-/// This algorithm may return an incorrect count in some cases (e.g. left, right expansion and is
-/// then matches both on the following term.)
-/// I think to fix this we would need to iterate all positions simultaneously,
-/// but not sure if that's worth it. (It may be considerable slower - untested)
-///
-/// left_slops is allowed to be empty, which equals to a slop of 0 so far.
-#[inline]
-fn intersection_count_with_carrying_slop(
-    left_positions: &mut Vec<u32>,
-    left_slops: &mut Vec<u8>,
-    right_positions: &[u32],
-    max_slop: u32,
-    update_left: bool,
-    positions_buffer: &mut Vec<u32>,
-    slops_buffer: &mut Vec<u8>,
-) -> u32 {
-    let mut left_index = 0;
-    let mut right_index = 0;
-    let mut count = 0;
-
-    if left_positions.is_empty() || right_positions.is_empty() {
-        if update_left {
-            left_positions.clear();
-            left_slops.clear();
-        }
-        return 0;
-    }
-
-    let add_val = |val: (u8, u32), new_left: &mut Vec<u32>, new_slops: &mut Vec<u8>| {
-        if update_left {
-            let pos_exists = new_left.last().map(|v| *v == val.1).unwrap_or(false);
-            if pos_exists {
-                let last_slop = new_slops.last_mut().unwrap();
-                *last_slop = (*last_slop).min(val.0);
-            } else {
-                new_left.push(val.1);
-                new_slops.push(val.0);
-            }
-        }
-    };
-    loop {
-        let left_val = left_positions[left_index];
-        let slop_so_far = left_slops.get(left_index).cloned().unwrap_or(0);
-        let right_val = right_positions[right_index];
-
-        let distance = slop_so_far as u32 + left_val.abs_diff(right_val);
-        if distance <= max_slop {
-            let (smaller_val, larger_val, mut smaller_val_idx, smaller_val_positions) =
-                if left_val < right_val {
-                    (left_val, right_val, left_index, left_positions.as_slice())
-                } else {
-                    (right_val, left_val, right_index, right_positions)
-                };
-
-            let mut new_slop = distance;
-            add_val(
-                (new_slop as u8, smaller_val),
-                positions_buffer,
-                slops_buffer,
-            );
-            while smaller_val_idx + 1 < smaller_val_positions.len() {
-                // there could be a better match
-                let next_val = smaller_val_positions[smaller_val_idx + 1];
-                if next_val > larger_val {
-                    // the next value is outside the range, so current one is the best.
-                    break;
-                }
-                let distance = next_val.abs_diff(larger_val);
-
-                // the next value is better.
-                smaller_val_idx += 1;
-                // better slop
-                new_slop = slop_so_far as u32 + distance;
-                add_val((new_slop as u8, next_val), positions_buffer, slops_buffer);
-            }
-
-            add_val((new_slop as u8, larger_val), positions_buffer, slops_buffer);
-            count += 1;
-            left_index += 1;
-            right_index += 1;
-        } else if left_val < right_val {
-            left_index += 1;
-        } else {
-            right_index += 1;
-        }
-
-        if left_index >= left_positions.len() || right_index >= right_positions.len() {
-            // finish rest
-            if left_index >= left_positions.len() {
-                let left_val = *left_positions.last().unwrap();
-                let slop_so_far: u8 = *left_slops.last().unwrap_or(&0);
-                for right_val in &right_positions[right_index..] {
-                    let new_slop = left_val.abs_diff(*right_val) + slop_so_far as u32;
-                    if new_slop <= max_slop {
-                        add_val((new_slop as u8, *right_val), positions_buffer, slops_buffer);
-                    }
-                }
-            } else {
-                let right_val = *right_positions.last().unwrap();
-                for left_idx in left_index..left_positions.len() {
-                    let left_val = left_positions[left_idx];
-                    let slop_so_far = *left_slops.get(left_idx).unwrap_or(&0);
-                    let new_slop = left_val.abs_diff(right_val) + slop_so_far as u32;
-                    if new_slop <= max_slop {
-                        add_val((new_slop as u8, left_val), positions_buffer, slops_buffer);
-                    }
-                }
-            };
-
-            break;
-        }
-    }
-    if update_left {
-        std::mem::swap(left_positions, positions_buffer);
-        std::mem::swap(left_slops, slops_buffer);
-        positions_buffer.clear();
-        slops_buffer.clear();
-    }
-
-    count
 }
 
 impl<TPostings: Postings> PhraseScorer<TPostings> {
@@ -390,9 +376,8 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
             similarity_weight_opt,
             fieldnorm_reader,
             slop,
-            left_slops: Vec::with_capacity(100),
-            slops_buffer: Vec::with_capacity(100),
-            positions_buffer: Vec::with_capacity(100),
+            current_spans: Vec::with_capacity(100),
+            spans_buffer: Vec::with_capacity(100),
         };
         if scorer.doc() != TERMINATED && !scorer.phrase_match() {
             scorer.advance();
@@ -413,6 +398,7 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
         if self.similarity_weight_opt.is_some() {
             let count = self.compute_phrase_count();
             self.phrase_count = count;
+            println!("phrase_count: {}", count);
             count > 0u32
         } else {
             self.phrase_exists()
@@ -422,8 +408,8 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
     fn phrase_exists(&mut self) -> bool {
         self.compute_phrase_match();
         if self.has_slop() {
-            intersection_exists_with_slop(
-                &self.left_positions,
+            intersection_exists_with_slop_with_spans(
+                &self.current_spans,
                 &self.right_positions[..],
                 self.slop,
             )
@@ -436,14 +422,11 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
         self.compute_phrase_match();
         if self.has_slop() {
             if self.num_terms > 2 {
-                intersection_count_with_carrying_slop(
-                    &mut self.left_positions,
-                    &mut self.left_slops,
-                    &self.right_positions[..],
+                intersection_count_with_slop_with_spans(
+                    &mut self.current_spans,
+                    &self.right_positions,
                     self.slop,
-                    false,
-                    &mut self.positions_buffer,
-                    &mut self.slops_buffer,
+                    &mut self.spans_buffer,
                 )
             } else {
                 intersection_count_with_slop(
@@ -459,44 +442,55 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
     }
 
     fn compute_phrase_match(&mut self) {
-        {
+        self.intersection_docset
+            .docset_mut_specialized(0)
+            .positions(&mut self.left_positions);
+
+        if self.num_terms == 2 {
+            // we actually just prepare positions when there are only two terms in this method
             self.intersection_docset
-                .docset_mut_specialized(0)
-                .positions(&mut self.left_positions);
-            if self.has_slop() {
-                self.left_slops.clear();
-            }
+                .docset_mut_specialized(1)
+                .positions(&mut self.right_positions);
+
+            return;
         }
-        for i in 1..self.num_terms - 1 {
-            {
+
+        if self.has_slop() {
+            // If having slop, we should keep the position span info to consider all possible
+            // situations
+            self.current_spans.clear();
+            self.current_spans.reserve(self.left_positions.len());
+            self.current_spans
+                .extend(self.left_positions.iter().map(|&pos| PositionSpan {
+                    left: pos,
+                    right: pos,
+                }));
+            for i in 1..self.num_terms - 1 {
                 self.intersection_docset
                     .docset_mut_specialized(i)
                     .positions(&mut self.right_positions);
-            }
-            if self.has_slop() {
-                if self.num_terms > 2 {
-                    intersection_count_with_carrying_slop(
-                        &mut self.left_positions,
-                        &mut self.left_slops,
-                        &self.right_positions[..],
-                        self.slop,
-                        true,
-                        &mut self.positions_buffer,
-                        &mut self.slops_buffer,
-                    );
-                } else {
-                    intersection_count_with_slop(
-                        &mut self.left_positions,
-                        &self.right_positions[..],
-                        self.slop,
-                        true,
-                    );
+                intersection_count_with_slop_with_spans(
+                    &mut self.current_spans,
+                    &self.right_positions,
+                    self.slop,
+                    &mut self.spans_buffer,
+                );
+
+                if self.current_spans.is_empty() {
+                    return;
                 }
-            } else {
+            }
+        } else {
+            for i in 1..self.num_terms - 1 {
+                self.intersection_docset
+                    .docset_mut_specialized(i)
+                    .positions(&mut self.right_positions);
+
                 intersection(&mut self.left_positions, &self.right_positions);
-            };
-            if self.left_positions.is_empty() {
-                return;
+
+                if self.left_positions.is_empty() {
+                    return;
+                }
             }
         }
         self.intersection_docset
@@ -612,57 +606,144 @@ mod tests {
 
     fn test_carry_slop_intersection_aux(
         right: &[&[u32]],
-        expected: &[(u8, u32)],
+        expected: &[PositionSpan],
         slop: u32,
         expected_count: u32,
     ) {
-        let mut left_vec = right[0].to_vec();
-        let mut slops = vec![0; left_vec.len()];
+        let left_vec = right[0].to_vec();
+        let mut position_spans = left_vec
+            .iter()
+            .map(|&pos| PositionSpan {
+                left: pos,
+                right: pos,
+            })
+            .collect::<Vec<_>>();
         let mut count = 0;
         for right in &right[1..] {
-            count = intersection_count_with_carrying_slop(
-                &mut left_vec,
-                &mut slops,
+            count = intersection_count_with_slop_with_spans(
+                &mut position_spans,
                 right,
                 slop,
-                true,
-                &mut Vec::new(),
                 &mut Vec::new(),
             );
         }
-        let out: Vec<(u8, u32)> = slops
-            .iter()
-            .cloned()
-            .zip(left_vec.iter().cloned())
-            .collect();
-        assert_eq!(&out, expected);
+        assert_eq!(&position_spans, expected);
         assert_eq!(count, expected_count);
     }
 
     #[test]
     fn test_carry_slop_intersection() {
         test_carry_slop_intersection_aux(&[&[1], &[]], &[], 1, 0);
-        test_carry_slop_intersection_aux(&[&[1], &[2]], &[(1, 1), (1, 2)], 1, 1);
         test_carry_slop_intersection_aux(&[&[1], &[3]], &[], 1, 0);
-        test_carry_slop_intersection_aux(&[&[1], &[2]], &[(1, 1), (1, 2)], 1, 1);
+        test_carry_slop_intersection_aux(
+            &[&[1], &[2]],
+            &[PositionSpan { left: 1, right: 2 }],
+            1,
+            1,
+        );
 
-        // The order may still matter
-        test_carry_slop_intersection_aux(&[&[1], &[2], &[2]], &[(1, 2)], 1, 1);
-        test_carry_slop_intersection_aux(&[&[2], &[1], &[2]], &[(1, 2)], 1, 1);
-        test_carry_slop_intersection_aux(&[&[2], &[2], &[1]], &[(1, 1), (1, 2)], 1, 1);
+        test_carry_slop_intersection_aux(
+            &[&[1], &[2], &[2]],
+            &[PositionSpan { left: 1, right: 2 }],
+            1,
+            1,
+        );
+        test_carry_slop_intersection_aux(
+            &[&[2], &[1], &[2]],
+            &[PositionSpan { left: 1, right: 2 }],
+            1,
+            1,
+        );
+        test_carry_slop_intersection_aux(
+            &[&[2], &[2], &[1]],
+            &[PositionSpan { left: 1, right: 2 }],
+            1,
+            1,
+        );
 
-        test_carry_slop_intersection_aux(&[&[2], &[2], &[1], &[2]], &[(1, 2)], 1, 1);
-        test_carry_slop_intersection_aux(&[&[1], &[2], &[2], &[2]], &[(1, 2)], 1, 1);
+        test_carry_slop_intersection_aux(
+            &[&[2], &[2], &[1], &[2]],
+            &[PositionSpan { left: 1, right: 2 }],
+            1,
+            1,
+        );
+        test_carry_slop_intersection_aux(
+            &[&[1], &[2], &[2], &[2]],
+            &[PositionSpan { left: 1, right: 2 }],
+            1,
+            1,
+        );
 
-        test_carry_slop_intersection_aux(&[&[1], &[2], &[1]], &[(1, 1)], 1, 1);
+        test_carry_slop_intersection_aux(
+            &[&[1], &[2], &[1]],
+            &[PositionSpan { left: 1, right: 2 }],
+            1,
+            1,
+        );
 
-        test_carry_slop_intersection_aux(&[&[11], &[10, 12]], &[(1, 10), (1, 11), (1, 12)], 1, 1);
-        test_carry_slop_intersection_aux(&[&[10, 12], &[11]], &[(1, 10), (1, 11), (1, 12)], 1, 1);
+        test_carry_slop_intersection_aux(
+            &[&[11], &[10, 12]],
+            &[
+                PositionSpan {
+                    left: 10,
+                    right: 11,
+                },
+                PositionSpan {
+                    left: 11,
+                    right: 12,
+                },
+            ],
+            1,
+            1,
+        );
+        test_carry_slop_intersection_aux(
+            &[&[10, 12], &[11]],
+            &[
+                PositionSpan {
+                    left: 10,
+                    right: 11,
+                },
+                PositionSpan {
+                    left: 11,
+                    right: 12,
+                },
+            ],
+            1,
+            1,
+        );
 
         test_carry_slop_intersection_aux(
             &[&[5, 7, 11], &[1, 5, 10, 12]],
-            &[(0, 5), (1, 10), (1, 11), (1, 12)],
+            &[
+                PositionSpan { left: 5, right: 5 },
+                PositionSpan {
+                    left: 10,
+                    right: 11,
+                },
+                PositionSpan {
+                    left: 11,
+                    right: 12,
+                },
+            ],
             1,
+            2,
+        );
+
+        test_carry_slop_intersection_aux(
+            &[&[5, 7, 11], &[1, 5, 10, 12]],
+            &[
+                PositionSpan { left: 5, right: 5 },
+                PositionSpan { left: 5, right: 7 },
+                PositionSpan {
+                    left: 10,
+                    right: 11,
+                },
+                PositionSpan {
+                    left: 11,
+                    right: 12,
+                },
+            ],
+            3,
             2,
         );
     }
@@ -676,11 +757,11 @@ mod bench {
     use super::*;
 
     #[bench]
-    fn bench_intersection_short_slop_carrying(b: &mut Bencher) {
+    fn bench_intersection_short_with_slop_with_spans(b: &mut Bencher) {
         let mut left = Vec::new();
         let mut left_slops = Vec::new();
         let mut buffer = Vec::new();
-        let mut slop_buffer = Vec::new();
+        let mut spans = Vec::new();
         b.iter(|| {
             left.clear();
             left.extend_from_slice(&[1, 5, 10, 12]);
@@ -688,15 +769,12 @@ mod bench {
             let right = [5, 7];
             intersection(&mut left, &right);
 
-            intersection_count_with_carrying_slop(
-                &mut left,
-                &mut left_slops,
-                &right,
-                2,
-                true,
-                &mut buffer,
-                &mut slop_buffer,
-            )
+            spans.clear();
+            spans.extend(left.iter().map(|&pos| PositionSpan {
+                left: pos,
+                right: pos,
+            }));
+            intersection_count_with_slop_with_spans(&mut spans, &right, 2, &mut buffer)
         });
     }
 
@@ -712,30 +790,18 @@ mod bench {
     }
 
     #[bench]
-    fn bench_intersection_medium_slop_carrying(b: &mut Bencher) {
-        let mut left = Vec::new();
-        let mut left_slops: Vec<u8> = Vec::new();
+    fn bench_intersection_medium_with_slop_with_spans(b: &mut Bencher) {
         let mut buffer = Vec::new();
-        let mut slop_buffer = Vec::new();
+        let mut spans = Vec::new();
         let left_data: Vec<u32> = (0..100).collect();
-        let left_slop_data: Vec<u8> = (0..100).map(|_| 0).collect();
-
         b.iter(|| {
-            left.clear();
-            left.extend_from_slice(&left_data);
-            left_slops.clear();
-            left_slops.extend_from_slice(&left_slop_data);
             let right = [5, 7, 55, 200];
-
-            intersection_count_with_carrying_slop(
-                &mut left,
-                &mut left_slops,
-                &right,
-                2,
-                true,
-                &mut buffer,
-                &mut slop_buffer,
-            )
+            spans.clear();
+            spans.extend(left_data.iter().map(|&pos| PositionSpan {
+                left: pos,
+                right: pos,
+            }));
+            intersection_count_with_slop_with_spans(&mut spans, &right, 2, &mut buffer)
         });
     }
 
