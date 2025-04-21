@@ -64,7 +64,7 @@ pub(crate) mod tests {
                 .map(|docaddr| docaddr.doc_id)
                 .collect::<Vec<_>>()
         };
-        // assert_eq!(test_query(vec!["a", "b"]), vec![1, 2, 3, 4]);
+        assert_eq!(test_query(vec!["a", "b"]), vec![1, 2, 3, 4]);
         assert_eq!(test_query(vec!["a", "b", "c"]), vec![2, 4]);
         assert_eq!(test_query(vec!["b", "b"]), vec![0, 1]);
         assert!(test_query(vec!["g", "ewrwer"]).is_empty());

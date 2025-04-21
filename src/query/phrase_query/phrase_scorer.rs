@@ -398,7 +398,6 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
         if self.similarity_weight_opt.is_some() {
             let count = self.compute_phrase_count();
             self.phrase_count = count;
-            println!("phrase_count: {}", count);
             count > 0u32
         } else {
             self.phrase_exists()
