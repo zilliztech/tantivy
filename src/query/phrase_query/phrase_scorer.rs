@@ -224,6 +224,10 @@ fn intersection_count_with_slop_with_spans(
     spans_buffer: &mut Vec<PositionSpan>,
 ) -> u32 {
     let mut count = 0;
+    // keep the index to start the next iteration
+    // prune elemtents that cannot be a best match
+    // ex: {{5, 7}, {8, 10}}, and next_positions: [1, 2, 3, 4, 5, 6, 9, 11]
+    // [1, 2, 3, 4, 5] cannot be a best match for {8, 10} due to {5, 7}.
     let mut start_index = 0;
     for prev_qualified in current_spans.iter() {
         let mut best_match = SmallVec::<[PositionSpan; 4]>::new();
@@ -284,16 +288,18 @@ fn intersection_count_with_slop_with_spans(
             }
         }
         if !best_match.is_empty() {
-            for span in best_match.into_iter() {
-                // only inc count if the new span is not overlap with the last span
-                if spans_buffer
-                    .last()
-                    .map_or(true, |last: &PositionSpan| last.non_overlap(&span))
-                {
-                    count += 1;
-                }
-                spans_buffer.push(span);
+            // distinguish the case:
+            // 1. {{8, 8}, {10, 10}} and {9}
+            // => {{8, 9}, {9, 10}}, with count = 1
+            // 2. {{6, 6}, {10, 10}} and {4, 8, 12}
+            // => {{4, 6}, {6, 8}, {8, 10}, {10, 12}}, with count = 2
+            // ( {4, 6}, {6, 8} and {8, 10}, {10, 12}} differnt chains )
+            if spans_buffer.last().map_or(true, |last: &PositionSpan| {
+                best_match.iter().any(|b| last.non_overlap(b))
+            }) {
+                count += 1;
             }
+            spans_buffer.extend(best_match);
         }
     }
     std::mem::swap(current_spans, spans_buffer);
@@ -743,6 +749,21 @@ mod tests {
                 },
             ],
             3,
+            2,
+        );
+
+        test_carry_slop_intersection_aux(
+            &[&[6, 10], &[4, 8, 12]],
+            &[
+                PositionSpan { left: 4, right: 6 },
+                PositionSpan { left: 6, right: 8 },
+                PositionSpan { left: 8, right: 10 },
+                PositionSpan {
+                    left: 10,
+                    right: 12,
+                },
+            ],
+            2,
             2,
         );
     }
