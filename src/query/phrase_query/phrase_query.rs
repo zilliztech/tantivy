@@ -147,3 +147,58 @@ impl Query for PhraseQuery {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use itertools::Itertools;
+
+    use super::PhraseQuery;
+    use crate::collector::DocSetCollector;
+    use crate::schema::{Schema, TEXT_WITH_DOC_ID};
+    use crate::{Index, Term};
+
+    #[test]
+    fn test_phrase_match() {
+        let mut schema_builder = Schema::builder();
+        let text = schema_builder.add_text_field("text", TEXT_WITH_DOC_ID);
+        schema_builder.enable_user_specified_doc_id();
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema.clone());
+
+        let mut index_writer = index.writer(50_000_000).unwrap();
+        index_writer
+            .add_document_with_doc_id(
+                0,
+                doc!(
+                    text => "boxing skiing"
+                ),
+            )
+            .unwrap();
+
+        index_writer
+            .add_document_with_doc_id(
+                1,
+                doc!(
+                    text => "skiing boxing"
+                ),
+            )
+            .unwrap();
+
+        index_writer.commit().unwrap();
+
+        let searcher = index.reader().unwrap().searcher();
+        let terms = vec![
+            Term::from_field_text(text, "boxing"),
+            Term::from_field_text(text, "skiing"),
+        ];
+
+        for (slop, &expected_doc_count) in [0, 1, 2].into_iter().zip(&[1, 1, 2]) {
+            let query = PhraseQuery::new_with_offset_and_slop(
+                terms.clone().into_iter().enumerate().collect_vec(),
+                slop,
+            );
+            let res = searcher.search(&query, &DocSetCollector {}).unwrap();
+            assert!(res.len() == expected_doc_count);
+        }
+    }
+}
