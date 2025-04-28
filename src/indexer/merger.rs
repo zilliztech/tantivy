@@ -305,11 +305,11 @@ fn serialize_merged_terms_for_user_id(
         // to filter docs that are deleted.
         let segment_doc_id_mapper = doc_id_mapper.segment_doc_id_mapper(segment_ord);
         if let Some(posting_entry) = PostingEntry::new(segment_doc_id_mapper, postings) {
-            heap.push(posting_entry);
+            heap.push(Reverse(posting_entry));
         }
     }
 
-    while let Some(mut next) = heap.pop() {
+    while let Some(Reverse(mut next)) = heap.pop() {
         let doc_id = next.cur_doc;
         let term_freq = if has_term_freq {
             next.postings.positions(positions_buffer);
@@ -326,7 +326,7 @@ fn serialize_merged_terms_for_user_id(
         field_serializer.write_doc(doc_id, term_freq, delta_positions);
 
         if next.advance() != TERMINATED {
-            heap.push(next);
+            heap.push(Reverse(next));
         }
     }
 
