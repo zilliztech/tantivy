@@ -1873,6 +1873,59 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_with_user_specified_doc_id_term_across_segments() {
+        let mut builder = schema::SchemaBuilder::new();
+        let text = builder.add_text_field("text", TEXT_WITH_DOC_ID);
+        builder.enable_user_specified_doc_id();
+        let index = Index::create_in_ram(builder.build());
+        let mut writer = index
+            .writer_with_num_threads(4, 4 * MEMORY_BUDGET_NUM_BYTES_MIN)
+            .unwrap();
+
+        for i in 0..1000 {
+            let _ = writer
+                .add_document_with_doc_id(
+                    i,
+                    doc!(
+                        text => "hello",
+                    ),
+                )
+                .unwrap();
+
+            if i % 100 == 0 {
+                writer.commit().unwrap();
+            }
+        }
+
+        writer.commit().unwrap();
+
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let term = Term::from_field_text(text, "hello");
+        let term_query = TermQuery::new(term, IndexRecordOption::Basic);
+        let doc_set = searcher.search(&term_query, &DocSetCollector).unwrap();
+        assert_eq!(doc_set.len(), 1000);
+
+        let segment_ids: Vec<SegmentId> = searcher
+            .segment_readers()
+            .iter()
+            .map(|reader| reader.segment_id())
+            .collect();
+        if let Err(e) = writer.merge(&segment_ids[..]).wait() {
+            assert!(e.to_string().contains(
+                "This is not necessarily a bug, and can happen after a rollback for instance."
+            ));
+        }
+
+        reader.reload().unwrap();
+        let searcher = reader.searcher();
+        let term = Term::from_field_text(text, "hello");
+        let term_query = TermQuery::new(term, IndexRecordOption::Basic);
+        let doc_set = searcher.search(&term_query, &DocSetCollector).unwrap();
+        assert_eq!(doc_set.len(), 1000);
+    }
+
+    #[test]
     fn test_merge_with_user_specified_doc_id_with_delete() {
         let mut builder = schema::SchemaBuilder::new();
         let text = builder.add_text_field("text", TEXT_WITH_DOC_ID);
