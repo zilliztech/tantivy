@@ -319,6 +319,10 @@ impl Directory for ManagedDirectory {
         self.directory.watch(watch_callback)
     }
 
+    fn unwatch_callbacks(&self) {
+        self.directory.unwatch_callbacks();
+    }
+
     fn sync_directory(&self) -> io::Result<()> {
         self.directory.sync_directory()?;
         Ok(())
