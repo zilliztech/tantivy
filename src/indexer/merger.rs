@@ -628,7 +628,7 @@ impl IndexMerger {
         Ok(())
     }
 
-    fn write_storable_fields(
+    async fn write_storable_fields(
         &self,
         store_writer: &mut StoreWriter,
         doc_id_mapping: &SegmentDocIdMapping,
@@ -655,7 +655,7 @@ impl IndexMerger {
                 let doc_bytes_it = &mut document_iterators[old_doc_addr.segment_ord as usize];
                 if let Some(doc_bytes_res) = doc_bytes_it.next() {
                     let doc_bytes = doc_bytes_res?;
-                    store_writer.store_bytes(&doc_bytes)?;
+                    store_writer.store_bytes(&doc_bytes).await?;
                 } else {
                     return Err(DataCorruption::comment_only(format!(
                         "unexpected missing document in docstore on merge, doc address \
@@ -687,10 +687,10 @@ impl IndexMerger {
                 {
                     for doc_bytes_res in store_reader.iter_raw(reader.alive_bitset()) {
                         let doc_bytes = doc_bytes_res?;
-                        store_writer.store_bytes(&doc_bytes)?;
+                        store_writer.store_bytes(&doc_bytes).await?;
                     }
                 } else {
-                    store_writer.stack(store_reader)?;
+                    store_writer.stack(store_reader).await?;
                 }
             }
         }
@@ -702,7 +702,7 @@ impl IndexMerger {
     ///
     /// # Returns
     /// The number of documents in the resulting segment.
-    pub fn write(&self, mut serializer: SegmentSerializer) -> crate::Result<u32> {
+    pub async fn write(&self, mut serializer: SegmentSerializer) -> crate::Result<u32> {
         let doc_id_mapping = if let Some(sort_by_field) = self.index_settings.sort_by_field.as_ref()
         {
             // If the documents are already sorted and stackable, we ignore the mapping and execute
@@ -731,12 +731,13 @@ impl IndexMerger {
         )?;
 
         debug!("write-storagefields");
-        self.write_storable_fields(serializer.get_store_writer(), &doc_id_mapping)?;
+        self.write_storable_fields(serializer.get_store_writer(), &doc_id_mapping)
+            .await?;
         debug!("write-fastfields");
         self.write_fast_fields(serializer.get_fast_field_write(), doc_id_mapping)?;
 
         debug!("close-serializer");
-        serializer.close()?;
+        serializer.close().await?;
         Ok(self.max_doc)
     }
 }

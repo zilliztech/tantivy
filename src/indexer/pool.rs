@@ -1,11 +1,14 @@
-use lazy_static::lazy_static;
-use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::str::FromStr;
 use std::{env, thread};
 
-const MILVUS_TANTIVY_MERGER_THREAD_NUM: &str = "MILVUS_TANTIVY_MERGER_THREAD_NUM";
+use lazy_static::lazy_static;
+use rayon::{ThreadPool, ThreadPoolBuilder};
+
+const MILVUS_TOKIO_MERGER_THREAD_NUM: &str = "MILVUS_TANTIVY_MERGER_THREAD_NUM";
 const MILVUS_TANTIVY_WRITER_THREAD_NUM: &str = "MILVUS_TANTIVY_WRITER_THREAD_NUM";
 const MILVUS_TOKIO_THREAD_NUM: &str = "MILVUS_TOKIO_THREAD_NUM";
+const MILVUS_TOKIO_DOCSTORE_COMPRESS_THREAD_NUM: &str =
+    "MILVUS_TANTIVY_DOCSTORE_COMPRESS_THREAD_NUM";
 
 lazy_static! {
     pub static ref TOKIO_RUNTIME: tokio::runtime::Runtime =
@@ -19,11 +22,19 @@ lazy_static! {
         .thread_name(|sz| format!("tantivy-writer{}", sz))
         .build()
         .expect("Failed to create tantivy-writer thread pool");
-    pub static ref MERGER_THREAD_POOL: ThreadPool = ThreadPoolBuilder::new()
-        .num_threads(get_num_thread(MILVUS_TANTIVY_MERGER_THREAD_NUM))
-        .thread_name(|sz| format!("tantivy-merger{}", sz))
-        .build()
-        .expect("Failed to create tantivy-writer thread pool");
+    pub static ref TOKIO_MERGER_THREAD_POOL: tokio::runtime::Runtime =
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(get_num_thread(MILVUS_TOKIO_MERGER_THREAD_NUM))
+            .thread_name("tantivy-merger")
+            .build()
+            .expect("Failed to create tantivy-writer thread pool");
+    pub static ref TOKIO_DOCSTORE_COMPRESS_RUNTIME: tokio::runtime::Runtime =
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(get_num_thread(MILVUS_TOKIO_DOCSTORE_COMPRESS_THREAD_NUM))
+            .thread_name("tantivy-doc-compress")
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime");
 }
 
 fn default_num_thread() -> usize {
@@ -49,8 +60,8 @@ mod tests {
     use std::env;
 
     use super::{
-        default_num_thread, get_num_thread, MILVUS_TANTIVY_MERGER_THREAD_NUM,
-        MILVUS_TANTIVY_WRITER_THREAD_NUM,
+        default_num_thread, get_num_thread, MILVUS_TANTIVY_WRITER_THREAD_NUM,
+        MILVUS_TOKIO_MERGER_THREAD_NUM,
     };
 
     #[test]
@@ -72,7 +83,7 @@ mod tests {
             let thread_num = get_num_thread(env_var);
             assert_eq!(thread_num, default_num);
         };
-        test_one(MILVUS_TANTIVY_MERGER_THREAD_NUM);
+        test_one(MILVUS_TOKIO_MERGER_THREAD_NUM);
         test_one(MILVUS_TANTIVY_WRITER_THREAD_NUM);
     }
 }
