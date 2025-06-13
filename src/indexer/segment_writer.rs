@@ -134,7 +134,7 @@ impl SegmentWriter {
     ///
     /// Finalize consumes the `SegmentWriter`, so that it cannot
     /// be used afterwards.
-    pub fn finalize(mut self) -> crate::Result<Vec<u64>> {
+    pub async fn finalize(mut self) -> crate::Result<Vec<u64>> {
         self.fieldnorms_writer.fill_up_to_max_doc(self.max_doc);
         let mapping: Option<DocIdMapping> = self
             .segment_serializer
@@ -152,7 +152,8 @@ impl SegmentWriter {
             &self.fieldnorms_writer,
             self.segment_serializer,
             mapping.as_ref(),
-        )?;
+        )
+        .await?;
         let doc_opstamps = remap_doc_opstamps(self.doc_opstamps, mapping.as_ref());
         Ok(doc_opstamps)
     }
@@ -346,13 +347,13 @@ impl SegmentWriter {
     /// Indexes a new document
     ///
     /// As a user, you should rather use `IndexWriter`'s add_document.
-    pub fn add_document(&mut self, add_operation: AddOperation) -> crate::Result<()> {
+    pub async fn add_document(&mut self, add_operation: AddOperation) -> crate::Result<()> {
         let AddOperation { document, opstamp } = add_operation;
         self.doc_opstamps.push(opstamp);
         self.fast_field_writers.add_document(&document)?;
         self.index_document(&document)?;
         let doc_writer = self.segment_serializer.get_store_writer();
-        doc_writer.store(&document, &self.schema)?;
+        doc_writer.store(&document, &self.schema).await?;
         self.max_doc += 1;
         Ok(())
     }
@@ -383,7 +384,7 @@ impl SegmentWriter {
 /// to the `SegmentSerializer`.
 ///
 /// `doc_id_map` is used to map to the new doc_id order.
-fn remap_and_write(
+async fn remap_and_write(
     per_field_postings_writers: &PerFieldPostingsWriter,
     ctx: IndexingContext,
     fast_field_writers: FastFieldsWriter,
@@ -423,7 +424,7 @@ fn remap_and_write(
             settings.docstore_compress_dedicated_thread,
         )?;
         let old_store_writer = std::mem::replace(&mut serializer.store_writer, store_writer);
-        old_store_writer.close()?;
+        old_store_writer.close().await?;
         let store_read = StoreReader::open(
             serializer
                 .segment()
@@ -433,12 +434,15 @@ fn remap_and_write(
         )?;
         for old_doc_id in doc_id_map.iter_old_doc_ids() {
             let doc_bytes = store_read.get_document_bytes(old_doc_id)?;
-            serializer.get_store_writer().store_bytes(&doc_bytes)?;
+            serializer
+                .get_store_writer()
+                .store_bytes(&doc_bytes)
+                .await?;
         }
     }
 
     debug!("serializer-close");
-    serializer.close()?;
+    serializer.close().await?;
 
     Ok(())
 }
@@ -475,8 +479,8 @@ mod tests {
         assert_eq!(compute_initial_table_size(4_000_000_000).unwrap(), 1 << 19);
     }
 
-    #[test]
-    fn test_prepare_for_store() {
+    #[tokio::test]
+    async fn test_prepare_for_store() {
         let mut schema_builder = Schema::builder();
         let text_field = schema_builder.add_text_field("title", TEXT | STORED);
         let schema = schema_builder.build();
@@ -500,8 +504,8 @@ mod tests {
         let store_wrt = directory.open_write(path).unwrap();
 
         let mut store_writer = StoreWriter::new(store_wrt, Compressor::None, 0, false).unwrap();
-        store_writer.store(&doc, &schema).unwrap();
-        store_writer.close().unwrap();
+        store_writer.store(&doc, &schema).await.unwrap();
+        store_writer.close().await.unwrap();
 
         let reader = StoreReader::open(directory.open_read(path).unwrap(), 0).unwrap();
         let doc = reader.get(0).unwrap();

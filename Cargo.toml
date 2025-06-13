@@ -88,6 +88,7 @@ futures = "0.3.21"
 paste = "1.0.11"
 more-asserts = "0.3.1"
 rand_distr = "0.4.3"
+tokio = { version = "1.29.1", features = ["rt-multi-thread", "macros"] }
 
 [target.'cfg(not(windows))'.dev-dependencies]
 criterion = "0.5"
