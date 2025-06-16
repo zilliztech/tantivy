@@ -518,7 +518,7 @@ impl Index {
         self.inventory.new_segment_meta(segment_id, max_doc)
     }
 
-    /// Open the index using the provided directory
+    /// Open the index using the provided directory.
     pub fn open<T: Into<Box<dyn Directory>>>(directory: T) -> crate::Result<Index> {
         let directory = directory.into();
         let directory = ManagedDirectory::wrap(directory)?;
