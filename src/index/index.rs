@@ -466,9 +466,11 @@ impl Index {
         Index::open(mmap_directory)
     }
 
-    /// Opens a new directory from an index path.
+    /// Opens an index from a directory path and loads it entirely into memory.
     ///
-    /// The directory is opened as a [`MmapDirectory`] and then converted to a [`RamDirectory`].
+    /// This method first opens the directory as a [`MmapDirectory`], then converts it to a
+    /// [`RamDirectory`]. After the conversion, the loaded index is completely independent
+    /// of the original directory and will not be affected by updates to the original directory.
     #[cfg(feature = "mmap")]
     pub fn open_in_dir_in_ram<P: AsRef<Path>>(directory_path: P) -> crate::Result<Index> {
         let mmap_directory = MmapDirectory::open(directory_path)?;
