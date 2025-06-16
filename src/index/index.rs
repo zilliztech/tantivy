@@ -466,6 +466,16 @@ impl Index {
         Index::open(mmap_directory)
     }
 
+    /// Opens a new directory from an index path.
+    ///
+    /// The directory is opened as a [`MmapDirectory`] and then converted to a [`RamDirectory`].
+    #[cfg(feature = "mmap")]
+    pub fn open_in_dir_in_ram<P: AsRef<Path>>(directory_path: P) -> crate::Result<Index> {
+        let mmap_directory = MmapDirectory::open(directory_path)?;
+        let ram_directory = mmap_directory.convert_to_ram_directory()?;
+        Index::open(ram_directory)
+    }
+
     /// Returns the list of the segment metas tracked by the index.
     ///
     /// Such segments can of course be part of the index,

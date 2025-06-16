@@ -20,8 +20,8 @@ use crate::directory::error::{
 };
 use crate::directory::file_watcher::FileWatcher;
 use crate::directory::{
-    AntiCallToken, Directory, DirectoryLock, FileHandle, Lock, OwnedBytes, TerminatingWrite,
-    WatchCallback, WatchHandle, WritePtr,
+    AntiCallToken, Directory, DirectoryLock, FileHandle, Lock, OwnedBytes, RamDirectory,
+    TerminatingWrite, WatchCallback, WatchHandle, WritePtr,
 };
 
 pub type ArcBytes = Arc<dyn Deref<Target = [u8]> + Send + Sync + 'static>;
@@ -199,6 +199,39 @@ impl MmapDirectory {
         MmapDirectory {
             inner: Arc::new(inner),
         }
+    }
+
+    pub fn convert_to_ram_directory(self) -> Result<RamDirectory, OpenDirectoryError> {
+        let ram_dir = RamDirectory::create();
+        let root_path = &self.inner.root_path;
+
+        let wrap_error = |e: Box<dyn std::error::Error + Send + Sync>| {
+            let io_err = std::io::Error::new(std::io::ErrorKind::Other, e.to_string());
+            OpenDirectoryError::wrap_io_error(io_err, root_path.clone())
+        };
+
+        for entry in fs::read_dir(root_path).map_err(|e| wrap_error(Box::new(e)))? {
+            let entry = entry.map_err(|e| wrap_error(Box::new(e)))?;
+            let file_path = entry.path();
+
+            if !file_path.is_file() || file_path.to_string_lossy().ends_with(".lock") {
+                continue;
+            }
+
+            let relative_path = file_path
+                .strip_prefix(root_path)
+                .map_err(|e| wrap_error(Box::new(e)))?;
+
+            let content = self
+                .atomic_read(&relative_path)
+                .map_err(|e| wrap_error(Box::new(e)))?;
+
+            ram_dir
+                .atomic_write(&relative_path, &content)
+                .map_err(|e| wrap_error(Box::new(e)))?;
+        }
+
+        Ok(ram_dir)
     }
 
     /// Creates a new MmapDirectory in a temporary directory.

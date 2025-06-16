@@ -249,6 +249,7 @@ mod tests {
     use std::path::Path;
 
     use super::RamDirectory;
+    use crate::directory::MmapDirectory;
     use crate::Directory;
 
     #[test]
@@ -285,5 +286,20 @@ mod tests {
         assert_eq!(dir.atomic_read(test).unwrap(), b"original");
         assert_eq!(&dir_clone.atomic_read(test).unwrap(), b"clone");
         assert_eq!(&dir_clone.atomic_read(test2).unwrap(), b"clone2");
+    }
+
+    #[test]
+    fn test_load_in_ram() {
+        let mmap_directory = MmapDirectory::create_from_tempdir().unwrap();
+        let test = Path::new("test");
+        let test2 = Path::new("test2");
+        let lock = Path::new(".lock");
+        mmap_directory.atomic_write(test, b"firstwrite").unwrap();
+        mmap_directory.atomic_write(test2, b"secondwrite").unwrap();
+        mmap_directory.atomic_write(lock, b"lock").unwrap();
+        let ram_directory = mmap_directory.convert_to_ram_directory().unwrap();
+        assert_eq!(ram_directory.atomic_read(test).unwrap(), b"firstwrite");
+        assert_eq!(ram_directory.atomic_read(test2).unwrap(), b"secondwrite");
+        assert!(ram_directory.atomic_read(lock).is_err());
     }
 }

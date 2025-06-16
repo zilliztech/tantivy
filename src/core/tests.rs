@@ -133,11 +133,13 @@ fn test_index_on_commit_reload_policy() -> crate::Result<()> {
 #[cfg(feature = "mmap")]
 mod mmap_specific {
 
+    use std::ops::Bound;
     use std::path::PathBuf;
 
     use tempfile::TempDir;
 
     use super::*;
+    use crate::query::RangeQuery;
 
     #[test]
     fn test_index_on_commit_reload_policy_mmap() -> crate::Result<()> {
@@ -195,6 +197,41 @@ mod mmap_specific {
             .unwrap();
         assert_eq!(reader.searcher().num_docs(), 0);
         test_index_on_commit_reload_policy_aux(field, &write_index, &reader)
+    }
+
+    #[test]
+    fn test_index_open_in_dir_in_ram() -> crate::Result<()> {
+        let schema = throw_away_schema();
+        let field = schema.get_field("num_likes").unwrap();
+        let tempdir = TempDir::new().unwrap();
+        let tempdir_path = PathBuf::from(tempdir.path());
+
+        {
+            let index = Index::create_in_dir(&tempdir_path, schema).unwrap();
+            let mut writer = index.writer_for_tests().unwrap();
+            writer.add_document(doc!(field=>1u64)).unwrap();
+            writer.add_document(doc!(field=>2u64)).unwrap();
+            writer.commit().unwrap();
+
+            writer.add_document(doc!(field=>3u64)).unwrap();
+            writer.add_document(doc!(field=>4u64)).unwrap();
+            writer.commit().unwrap();
+        }
+
+        let ram_index = Index::open_in_dir_in_ram(&tempdir_path).unwrap();
+        let reader = ram_index.reader().unwrap();
+        let searcher = reader.searcher();
+        let count = searcher
+            .search(
+                &RangeQuery::new(
+                    Bound::Included(Term::from_field_u64(field, 1)),
+                    Bound::Included(Term::from_field_u64(field, 4)),
+                ),
+                &Count,
+            )
+            .unwrap();
+        assert_eq!(count, 4);
+        Ok(())
     }
 }
 fn test_index_on_commit_reload_policy_aux(
