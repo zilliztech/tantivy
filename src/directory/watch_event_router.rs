@@ -1,5 +1,6 @@
 use std::sync::{Arc, RwLock, Weak};
 
+use crate::indexer::MISC_POOL;
 use crate::FutureResult;
 
 /// Cloneable wrapper for callbacks registered when watching files of a `Directory`.
@@ -86,20 +87,14 @@ impl WatchCallbackList {
             let _ = sender.send(Ok(()));
             return result;
         }
-        let spawn_res = std::thread::Builder::new()
-            .name("watch-callbacks".to_string())
-            .spawn(move || {
-                for callback in callbacks {
-                    callback.call();
-                }
-                let _ = sender.send(Ok(()));
-            });
-        if let Err(err) = spawn_res {
-            error!(
-                "Failed to spawn thread to call watch callbacks. Cause: {:?}",
-                err
-            );
-        }
+
+        MISC_POOL.spawn(move || {
+            for callback in callbacks {
+                callback.call();
+            }
+            let _ = sender.send(Ok(()));
+        });
+
         result
     }
 }

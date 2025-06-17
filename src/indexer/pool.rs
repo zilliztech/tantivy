@@ -9,6 +9,8 @@ const MILVUS_TANTIVY_WRITER_THREAD_NUM: &str = "MILVUS_TANTIVY_WRITER_THREAD_NUM
 const MILVUS_TOKIO_THREAD_NUM: &str = "MILVUS_TOKIO_THREAD_NUM";
 const MILVUS_TOKIO_DOCSTORE_COMPRESS_THREAD_NUM: &str =
     "MILVUS_TANTIVY_DOCSTORE_COMPRESS_THREAD_NUM";
+const MILVUS_TOKIO_FILE_WATCHER_THREAD_NUM: &str = "MILVUS_TOKIO_FILE_WATCHER_THREAD_NUM";
+const MILVUS_MISC_POLL: &str = "MILVUS_MISC_POLL";
 
 lazy_static! {
     pub static ref TOKIO_RUNTIME: tokio::runtime::Runtime =
@@ -35,6 +37,18 @@ lazy_static! {
             .enable_all()
             .build()
             .expect("Failed to create tokio runtime");
+    pub static ref TOKIO_FILE_WATCHER_WORKER_RUNTIME: tokio::runtime::Runtime =
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(get_num_thread(MILVUS_TOKIO_FILE_WATCHER_THREAD_NUM))
+            .thread_name("tantivy-file-watcher")
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime");
+    pub static ref MISC_POOL: ThreadPool = ThreadPoolBuilder::new()
+        .num_threads(get_num_thread(MILVUS_MISC_POLL))
+        .thread_name(|sz| format!("tantivy-misc{}", sz))
+        .build()
+        .expect("Failed to create tantivy-misc thread pool");
 }
 
 fn default_num_thread() -> usize {
