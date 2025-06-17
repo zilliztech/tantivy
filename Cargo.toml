@@ -70,7 +70,7 @@ tokenizer-api = { version = "0.2", path = "./tokenizer-api", package = "tantivy-
 sketches-ddsketch = { version = "0.2.1", features = ["use_serde"] }
 futures-util = { version = "0.3.28", optional = true }
 lazy_static = "1.5.0"
-tokio = { version = "1.29.1", features = ["rt-multi-thread"] }
+tokio = { version = "1.29.1", features = ["rt-multi-thread", "macros", "time"] }
 async-channel = "2.3.1"
 
 [target.'cfg(windows)'.dependencies]
@@ -88,7 +88,6 @@ futures = "0.3.21"
 paste = "1.0.11"
 more-asserts = "0.3.1"
 rand_distr = "0.4.3"
-tokio = { version = "1.29.1", features = ["rt-multi-thread", "macros"] }
 
 [target.'cfg(not(windows))'.dev-dependencies]
 criterion = "0.5"

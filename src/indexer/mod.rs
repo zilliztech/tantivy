@@ -27,7 +27,9 @@ pub use self::index_writer::IndexWriter;
 pub use self::log_merge_policy::LogMergePolicy;
 pub use self::merge_operation::MergeOperation;
 pub use self::merge_policy::{MergeCandidate, MergePolicy, NoMergePolicy};
-pub use self::pool::{TOKIO_DOCSTORE_COMPRESS_RUNTIME, TOKIO_RUNTIME};
+pub use self::pool::{
+    MISC_POOL, TOKIO_DOCSTORE_COMPRESS_RUNTIME, TOKIO_FILE_WATCHER_WORKER_RUNTIME, TOKIO_RUNTIME,
+};
 pub use self::prepared_commit::PreparedCommit;
 pub use self::segment_entry::SegmentEntry;
 pub use self::segment_serializer::SegmentSerializer;

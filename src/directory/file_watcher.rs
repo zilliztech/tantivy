@@ -1,13 +1,15 @@
 use std::io::BufRead;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use std::{fs, io, thread};
 
 use crc32fast::Hasher;
+use tokio::task::JoinHandle;
 
 use crate::directory::{WatchCallback, WatchCallbackList, WatchHandle};
+use crate::indexer::TOKIO_FILE_WATCHER_WORKER_RUNTIME;
 
 const POLLING_INTERVAL: Duration = Duration::from_millis(if cfg!(test) { 1 } else { 500 });
 
@@ -16,6 +18,8 @@ pub struct FileWatcher {
     path: Arc<Path>,
     callbacks: Arc<WatchCallbackList>,
     state: Arc<AtomicUsize>, // 0: new, 1: runnable, 2: terminated
+    watch_handle: RwLock<Option<JoinHandle<()>>>,
+    wakeup_channel: RwLock<Option<async_channel::Sender<()>>>,
 }
 
 impl FileWatcher {
@@ -24,6 +28,8 @@ impl FileWatcher {
             path: Arc::from(path),
             callbacks: Default::default(),
             state: Default::default(),
+            watch_handle: RwLock::new(None),
+            wakeup_channel: RwLock::new(None),
         }
     }
 
@@ -40,29 +46,34 @@ impl FileWatcher {
         let callbacks = self.callbacks.clone();
         let state = self.state.clone();
 
-        thread::Builder::new()
-            .name("thread-tantivy-meta-file-watcher".to_string())
-            .spawn(move || {
-                let mut current_checksum_opt = None;
-
-                while state.load(Ordering::SeqCst) == 1 {
-                    if let Ok(checksum) = FileWatcher::compute_checksum(&path) {
-                        let metafile_has_changed = current_checksum_opt
-                            .map(|current_checksum| current_checksum != checksum)
-                            .unwrap_or(true);
-                        if metafile_has_changed {
-                            info!("Meta file {:?} was modified", path);
-                            current_checksum_opt = Some(checksum);
-                            // We actually ignore callbacks failing here.
-                            // We just wait for the end of their execution.
-                            let _ = callbacks.broadcast().wait();
-                        }
+        let (tx, rx) = async_channel::bounded(5);
+        self.wakeup_channel.write().unwrap().replace(tx);
+        let task = async move {
+            let mut current_checksum_opt = None;
+            while state.load(Ordering::SeqCst) == 1 {
+                if let Ok(checksum) = FileWatcher::compute_checksum(&path) {
+                    let metafile_has_changed = current_checksum_opt
+                        .map(|current_checksum| current_checksum != checksum)
+                        .unwrap_or(true);
+                    if metafile_has_changed {
+                        info!("Meta file {:?} was modified", path);
+                        current_checksum_opt = Some(checksum);
+                        // We actually ignore callbacks failing here.
+                        // We just wait for the end of their execution.
+                        let _ = callbacks.broadcast().wait();
                     }
-
-                    thread::sleep(POLLING_INTERVAL);
                 }
-            })
-            .expect("Failed to spawn meta file watcher thread");
+
+                tokio::select! {
+                    _ = tokio::time::sleep(POLLING_INTERVAL) => {},
+                    _ = rx.recv() => {
+                        // Early wake up from sleep
+                    }
+                }
+            }
+        };
+        let watch_handle = TOKIO_FILE_WATCHER_WORKER_RUNTIME.spawn(task);
+        self.watch_handle.write().unwrap().replace(watch_handle);
     }
 
     pub fn watch(&self, callback: WatchCallback) -> WatchHandle {
@@ -91,6 +102,11 @@ impl FileWatcher {
 
     pub fn graceful_stop(&self) {
         self.state.store(2, Ordering::SeqCst);
+        if let Some(handle) = self.watch_handle.write().unwrap().take() {
+            let _ = self.wakeup_channel.write().unwrap().take();
+            handle.abort();
+            info!("Meta file watcher thread joined/aborted");
+        }
     }
 }
 
