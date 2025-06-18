@@ -466,6 +466,18 @@ impl Index {
         Index::open(mmap_directory)
     }
 
+    /// Opens an index from a directory path and loads it entirely into memory.
+    ///
+    /// This method first opens the directory as a [`MmapDirectory`], then converts it to a
+    /// [`RamDirectory`]. After the conversion, the loaded index is completely independent
+    /// of the original directory and will not be affected by updates to the original directory.
+    #[cfg(feature = "mmap")]
+    pub fn open_in_dir_in_ram<P: AsRef<Path>>(directory_path: P) -> crate::Result<Index> {
+        let mmap_directory = MmapDirectory::open(directory_path)?;
+        let ram_directory = mmap_directory.convert_to_ram_directory()?;
+        Index::open(ram_directory)
+    }
+
     /// Returns the list of the segment metas tracked by the index.
     ///
     /// Such segments can of course be part of the index,
@@ -506,7 +518,7 @@ impl Index {
         self.inventory.new_segment_meta(segment_id, max_doc)
     }
 
-    /// Open the index using the provided directory
+    /// Open the index using the provided directory.
     pub fn open<T: Into<Box<dyn Directory>>>(directory: T) -> crate::Result<Index> {
         let directory = directory.into();
         let directory = ManagedDirectory::wrap(directory)?;
