@@ -25,9 +25,7 @@ use crate::{DocId, Opstamp, TantivyError};
 /// Note this is a very dumb way to compute log2, but it is easier to proofread that way.
 fn compute_initial_table_size(per_thread_memory_budget: usize) -> crate::Result<usize> {
     let table_memory_upper_bound = per_thread_memory_budget / 3;
-    (10..20) // We cap it at 2^19 = 512K capacity.
-        // TODO: There are cases where this limit causes a
-        // reallocation in the hashmap. Check if this affects performance.
+    (10..18) // Cap at 2^17 = 128K capacity (1MB hash table)
         .map(|power| 1 << power)
         .take_while(|capacity| compute_table_memory_size(*capacity) < table_memory_upper_bound)
         .last()
@@ -99,19 +97,23 @@ impl SegmentWriter {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let ctx = IndexingContext::new(table_size);
+        let fast_field_writers = FastFieldsWriter::from_schema_and_tokenizer_manager(
+            &schema,
+            tokenizer_manager_fast_field,
+        )?;
+        let fieldnorms_writer = FieldNormsWriter::for_schema(&schema);
+        
         Ok(Self {
             num_docs: 0,
             max_doc: 0,
-            ctx: IndexingContext::new(table_size),
+            ctx,
             per_field_postings_writers,
-            fieldnorms_writer: FieldNormsWriter::for_schema(&schema),
+            fieldnorms_writer,
             json_path_writer: JsonPathWriter::default(),
             json_positions_per_path: IndexingPositionsPerPath::default(),
             segment_serializer,
-            fast_field_writers: FastFieldsWriter::from_schema_and_tokenizer_manager(
-                &schema,
-                tokenizer_manager_fast_field,
-            )?,
+            fast_field_writers,
             doc_opstamps: Vec::with_capacity(1_000),
             per_field_text_analyzers,
             term_buffer: Term::with_capacity(16),

@@ -15,7 +15,8 @@ const JSON_DEPTH_LIMIT: usize = 20;
 
 /// The `FastFieldsWriter` groups all of the fast field writers.
 pub struct FastFieldsWriter {
-    columnar_writer: ColumnarWriter,
+    /// Only created if schema has fast fields (memory optimization)
+    columnar_writer: Option<ColumnarWriter>,
     fast_field_names: Vec<Option<String>>, //< TODO see if we can hash the field name hash too.
     per_field_tokenizer: Vec<Option<TextAnalyzer>>,
     date_precisions: Vec<DateTimePrecision>,
@@ -37,7 +38,13 @@ impl FastFieldsWriter {
         schema: &Schema,
         tokenizer_manager: TokenizerManager,
     ) -> crate::Result<FastFieldsWriter> {
-        let mut columnar_writer = ColumnarWriter::default();
+        // Only create ColumnarWriter if there are fast fields (saves ~7MB memory)
+        let has_fast_fields = schema.fields().any(|(_, entry)| entry.field_type().is_fast());
+        let mut columnar_writer = if has_fast_fields {
+            Some(ColumnarWriter::default())
+        } else {
+            None
+        };
 
         let mut fast_field_names: Vec<Option<String>> = vec![None; schema.num_fields()];
         let mut date_precisions: Vec<DateTimePrecision> =
@@ -82,11 +89,13 @@ impl FastFieldsWriter {
 
             let sort_values_within_row = value_type == Type::Facet;
             if let Some(column_type) = value_type_to_column_type(value_type) {
-                columnar_writer.record_column_type(
-                    field_entry.name(),
-                    column_type,
-                    sort_values_within_row,
-                );
+                if let Some(ref mut writer) = columnar_writer {
+                    writer.record_column_type(
+                        field_entry.name(),
+                        column_type,
+                        sort_values_within_row,
+                    );
+                }
             }
         }
         Ok(FastFieldsWriter {
@@ -102,7 +111,7 @@ impl FastFieldsWriter {
 
     /// The memory used (inclusive childs)
     pub fn mem_usage(&self) -> usize {
-        self.columnar_writer.mem_usage()
+        self.columnar_writer.as_ref().map_or(0, |w| w.mem_usage())
     }
 
     /// Indexes all of the fastfields of a new document.
@@ -128,6 +137,12 @@ impl FastFieldsWriter {
             Some(name) => name,
         };
 
+        // If no columnar_writer, nothing to do (no fast fields in schema)
+        let columnar_writer = match &mut self.columnar_writer {
+            Some(w) => w,
+            None => return Ok(()),
+        };
+
         match value.as_value() {
             ReferenceValue::Leaf(leaf) => match leaf {
                 ReferenceValueLeaf::Null => {}
@@ -137,29 +152,29 @@ impl FastFieldsWriter {
                     {
                         let mut token_stream = tokenizer.token_stream(val);
                         token_stream.process(&mut |token: &Token| {
-                            self.columnar_writer
+                            columnar_writer
                                 .record_str(doc_id, field_name, &token.text);
                         })
                     } else {
-                        self.columnar_writer.record_str(doc_id, field_name, val);
+                        columnar_writer.record_str(doc_id, field_name, val);
                     }
                 }
                 ReferenceValueLeaf::U64(val) => {
-                    self.columnar_writer.record_numerical(
+                    columnar_writer.record_numerical(
                         doc_id,
                         field_name,
                         NumericalValue::from(val),
                     );
                 }
                 ReferenceValueLeaf::I64(val) => {
-                    self.columnar_writer.record_numerical(
+                    columnar_writer.record_numerical(
                         doc_id,
                         field_name,
                         NumericalValue::from(val),
                     );
                 }
                 ReferenceValueLeaf::F64(val) => {
-                    self.columnar_writer.record_numerical(
+                    columnar_writer.record_numerical(
                         doc_id,
                         field_name,
                         NumericalValue::from(val),
@@ -168,24 +183,24 @@ impl FastFieldsWriter {
                 ReferenceValueLeaf::Date(val) => {
                     let date_precision = self.date_precisions[field.field_id() as usize];
                     let truncated_datetime = val.truncate(date_precision);
-                    self.columnar_writer
+                    columnar_writer
                         .record_datetime(doc_id, field_name, truncated_datetime);
                 }
                 ReferenceValueLeaf::Facet(val) => {
-                    self.columnar_writer.record_str(doc_id, field_name, val);
+                    columnar_writer.record_str(doc_id, field_name, val);
                 }
                 ReferenceValueLeaf::Bytes(val) => {
-                    self.columnar_writer.record_bytes(doc_id, field_name, val);
+                    columnar_writer.record_bytes(doc_id, field_name, val);
                 }
                 ReferenceValueLeaf::IpAddr(val) => {
-                    self.columnar_writer.record_ip_addr(doc_id, field_name, val);
+                    columnar_writer.record_ip_addr(doc_id, field_name, val);
                 }
                 ReferenceValueLeaf::Bool(val) => {
-                    self.columnar_writer.record_bool(doc_id, field_name, val);
+                    columnar_writer.record_bool(doc_id, field_name, val);
                 }
                 ReferenceValueLeaf::PreTokStr(val) => {
                     for token in &val.tokens {
-                        self.columnar_writer
+                        columnar_writer
                             .record_str(doc_id, field_name, &token.text);
                     }
                 }
@@ -205,13 +220,14 @@ impl FastFieldsWriter {
                 self.json_path_buffer.set_expand_dots(expand_dots);
 
                 let text_analyzer = &mut self.per_field_tokenizer[field.field_id() as usize];
+                let columnar_writer = self.columnar_writer.as_mut().unwrap();
 
                 record_json_obj_to_columnar_writer::<V>(
                     doc_id,
                     val,
                     JSON_DEPTH_LIMIT,
                     &mut self.json_path_buffer,
-                    &mut self.columnar_writer,
+                    columnar_writer,
                     text_analyzer,
                 );
             }
@@ -224,7 +240,12 @@ impl FastFieldsWriter {
     /// order to the fast field serializer.
     pub fn serialize(mut self, wrt: &mut dyn io::Write) -> io::Result<()> {
         let num_docs = self.num_docs;
-        self.columnar_writer.serialize(num_docs, wrt)?;
+        if let Some(mut columnar_writer) = self.columnar_writer {
+            columnar_writer.serialize(num_docs, wrt)?;
+        } else {
+            // Write empty columnar format without allocating 7MB for ArenaHashMaps
+            ColumnarWriter::serialize_empty(num_docs, wrt)?;
+        }
         Ok(())
     }
 }

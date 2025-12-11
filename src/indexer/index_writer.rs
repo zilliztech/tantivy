@@ -29,8 +29,8 @@ use crate::{FutureResult, Opstamp};
 // in the `memory_arena` goes below MARGIN_IN_BYTES.
 pub const MARGIN_IN_BYTES: usize = 1_000_000;
 
-// We impose the memory per thread to be at least 15 MB, as the baseline consumption is 12MB.
-pub const MEMORY_BUDGET_NUM_BYTES_MIN: usize = ((MARGIN_IN_BYTES as u32) * 15u32) as usize;
+// We impose the memory per thread to be at least 3 MB (baseline consumption is ~1.5MB with optimizations).
+pub const MEMORY_BUDGET_NUM_BYTES_MIN: usize = ((MARGIN_IN_BYTES as u32) * 3u32) as usize;
 pub const MEMORY_BUDGET_NUM_BYTES_MAX: usize = u32::MAX as usize - MARGIN_IN_BYTES;
 
 // We impose the number of index writer threads to be at most this.

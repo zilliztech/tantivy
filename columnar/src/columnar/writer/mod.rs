@@ -46,7 +46,6 @@ struct SpareBuffers {
 /// let mut wrt: Vec<u8> =  Vec::new();
 /// columnar_writer.serialize(2u32, &mut wrt).unwrap();
 /// ```
-#[derive(Default)]
 pub struct ColumnarWriter {
     numerical_field_hash_map: ArenaHashMap,
     datetime_field_hash_map: ArenaHashMap,
@@ -60,7 +59,32 @@ pub struct ColumnarWriter {
     buffers: SpareBuffers,
 }
 
+impl Default for ColumnarWriter {
+    fn default() -> Self {
+        ColumnarWriter {
+            numerical_field_hash_map: ArenaHashMap::default(),
+            datetime_field_hash_map: ArenaHashMap::default(),
+            bool_field_hash_map: ArenaHashMap::default(),
+            ip_addr_field_hash_map: ArenaHashMap::default(),
+            bytes_field_hash_map: ArenaHashMap::default(),
+            str_field_hash_map: ArenaHashMap::default(),
+            arena: MemoryArena::default(),
+            dictionaries: Vec::new(),
+            buffers: SpareBuffers::default(),
+        }
+    }
+}
+
 impl ColumnarWriter {
+    /// Serialize an empty columnar (no columns) directly without allocating ArenaHashMaps.
+    /// This saves ~7MB memory compared to creating a default ColumnarWriter.
+    pub fn serialize_empty(num_docs: RowId, wrt: &mut dyn io::Write) -> io::Result<()> {
+        let mut serializer = ColumnarSerializer::new(wrt);
+        // No columns to serialize, just finalize with the format metadata
+        serializer.finalize(num_docs)?;
+        Ok(())
+    }
+
     pub fn mem_usage(&self) -> usize {
         self.arena.mem_usage()
             + self.numerical_field_hash_map.mem_usage()
