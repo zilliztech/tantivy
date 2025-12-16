@@ -5,6 +5,7 @@
 //! [`Index::writer`](crate::Index::writer).
 
 pub(crate) mod delete_queue;
+pub mod memory_config;
 pub(crate) mod path_to_unordered_id;
 
 pub(crate) mod doc_id_mapping;
@@ -31,8 +32,9 @@ mod stamper;
 
 use smallvec::SmallVec;
 
-pub use self::index_writer::{IndexWriter, IndexWriterOptions};
+pub use self::index_writer::{IndexWriter, IndexWriterOptions, SingletonIndexWriterOptions};
 pub use self::log_merge_policy::LogMergePolicy;
+pub use self::memory_config::MemoryProfile;
 pub use self::merge_operation::MergeOperation;
 pub use self::merge_policy::{MergeCandidate, MergePolicy, NoMergePolicy};
 use self::operation::AddOperation;

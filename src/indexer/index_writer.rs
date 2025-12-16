@@ -6,6 +6,7 @@ use std::thread;
 use common::BitSet;
 use smallvec::{smallvec, SmallVec};
 
+use super::memory_config::MemoryProfile;
 use super::operation::{AddOperation, UserOperation};
 use super::pool::{get_tokio_indexing_worker_pool, init_pool};
 use super::segment_updater::SegmentUpdater;
@@ -36,11 +37,6 @@ pub const MEMORY_BUDGET_NUM_BYTES_MAX: usize = u32::MAX as usize - MARGIN_IN_BYT
 // We impose the number of index writer threads to be at most this.
 pub const MAX_NUM_THREAD: usize = 8;
 
-// Add document will block if the number of docs waiting in the queue to be indexed
-// reaches `PIPELINE_MAX_SIZE_IN_DOCS`
-// Reduced from 10_000 to 1000 to minimize memory footprint for single-threaded scenarios.
-const PIPELINE_MAX_SIZE_IN_DOCS: usize = 1_000;
-
 pub(crate) fn error_in_index_worker_thread(context: &str) -> TantivyError {
     TantivyError::ErrorInThread(format!(
         "{context}. A worker thread encountered an error (io::Error most likely) or panicked."
@@ -63,6 +59,10 @@ pub struct IndexWriterOptions {
     /// Defines the number of merger workers to use.
     // todo(SpadeA): we should use this to limit the running merge operations
     num_merge_worker: usize,
+    #[builder(default)]
+    /// Memory profile for tuning memory usage.
+    /// Use `LowMemory` for scenarios with many small indexes (e.g., growing segments).
+    pub memory_profile: MemoryProfile,
 }
 
 #[derive(Clone, bon::Builder)]
@@ -373,8 +373,9 @@ impl<D: Document> IndexWriter<D> {
         // Init thread pools
         init_pool(singleton_options.clone());
 
+        let pipeline_size = options.memory_profile.pipeline_max_size();
         let (document_sender, document_receiver): (AddBatchSender<D>, AddBatchReceiver<D>) =
-            async_channel::bounded(PIPELINE_MAX_SIZE_IN_DOCS);
+            async_channel::bounded(pipeline_size);
 
         let delete_queue = DeleteQueue::new();
 
@@ -626,8 +627,9 @@ impl<D: Document> IndexWriter<D> {
     ///
     /// Returns the former segment_ready channel.
     fn recreate_document_channel(&mut self) {
+        let pipeline_size = self.options.memory_profile.pipeline_max_size();
         let (document_sender, document_receiver): (AddBatchSender<D>, AddBatchReceiver<D>) =
-            async_channel::bounded(PIPELINE_MAX_SIZE_IN_DOCS);
+            async_channel::bounded(pipeline_size);
         self.operation_sender = Arc::new(document_sender);
         self.index_writer_status = IndexWriterStatus::from(document_receiver);
     }
