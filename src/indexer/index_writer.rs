@@ -38,7 +38,7 @@ pub const MAX_NUM_THREAD: usize = 8;
 
 // Add document will block if the number of docs waiting in the queue to be indexed
 // reaches `PIPELINE_MAX_SIZE_IN_DOCS`
-const PIPELINE_MAX_SIZE_IN_DOCS: usize = 10_000;
+const PIPELINE_MAX_SIZE_IN_DOCS: usize = 1_000;
 
 pub(crate) fn error_in_index_worker_thread(context: &str) -> TantivyError {
     TantivyError::ErrorInThread(format!(

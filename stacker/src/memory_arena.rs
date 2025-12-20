@@ -24,8 +24,8 @@
 //! stores your object using `ptr::write_unaligned` and `ptr::read_unaligned`.
 use std::{mem, ptr};
 
-const NUM_BITS_PAGE_ADDR: usize = 20;
-const PAGE_SIZE: usize = 1 << NUM_BITS_PAGE_ADDR; // pages are 1 MB large
+const NUM_BITS_PAGE_ADDR: usize = 18;
+const PAGE_SIZE: usize = 1 << NUM_BITS_PAGE_ADDR; // pages are 256KB
 
 /// Represents a pointer into the `MemoryArena`
 /// .
@@ -106,7 +106,7 @@ impl MemoryArena {
     /// Returns an estimate in number of bytes
     /// of resident memory consumed by the `MemoryArena`.
     ///
-    /// Internally, it counts a number of `1MB` pages
+    /// Internally, it counts a number of `256KB` pages
     /// and therefore delivers an upperbound.
     pub fn mem_usage(&self) -> usize {
         self.pages.len() * PAGE_SIZE
@@ -198,10 +198,10 @@ struct Page {
 impl Page {
     fn new(page_id: usize) -> Page {
         // We use 32-bits addresses.
-        // - 20 bits for the in-page addressing
-        // - 12 bits for the page id.
-        // This limits us to 2^12 - 1=4095 for the page id.
-        assert!(page_id < 4096);
+        // - 18 bits for the in-page addressing
+        // - 14 bits for the page id.
+        // This limits us to 2^14 - 1=16383 for the page id.
+        assert!(page_id < 16384);
         Page {
             page_id,
             len: 0,

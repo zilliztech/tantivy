@@ -25,7 +25,7 @@ use crate::{DocId, Opstamp, TantivyError};
 /// Note this is a very dumb way to compute log2, but it is easier to proofread that way.
 fn compute_initial_table_size(per_thread_memory_budget: usize) -> crate::Result<usize> {
     let table_memory_upper_bound = per_thread_memory_budget / 3;
-    (10..20) // We cap it at 2^19 = 512K capacity.
+    (10..18) // Cap at 2^17 = 128K capacity (1MB hash table)
         // TODO: There are cases where this limit causes a
         // reallocation in the hashmap. Check if this affects performance.
         .map(|power| 1 << power)
@@ -480,9 +480,9 @@ mod tests {
         use super::compute_initial_table_size;
         assert_eq!(compute_initial_table_size(100_000).unwrap(), 1 << 12);
         assert_eq!(compute_initial_table_size(1_000_000).unwrap(), 1 << 15);
-        assert_eq!(compute_initial_table_size(15_000_000).unwrap(), 1 << 19);
-        assert_eq!(compute_initial_table_size(1_000_000_000).unwrap(), 1 << 19);
-        assert_eq!(compute_initial_table_size(4_000_000_000).unwrap(), 1 << 19);
+        assert_eq!(compute_initial_table_size(15_000_000).unwrap(), 1 << 17);
+        assert_eq!(compute_initial_table_size(1_000_000_000).unwrap(), 1 << 17);
+        assert_eq!(compute_initial_table_size(4_000_000_000).unwrap(), 1 << 17);
     }
 
     #[tokio::test]

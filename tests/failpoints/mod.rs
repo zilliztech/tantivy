@@ -77,7 +77,7 @@ fn test_fail_on_flush_segment() -> tantivy::Result<()> {
     let index = Index::create_in_ram(schema_builder.build());
     let index_writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
     fail::cfg("FieldSerializer::close_term", "return(simulatederror)").unwrap();
-    for i in 0..100_000 {
+    for i in 0..500_000 {
         if index_writer
             .add_document(doc!(text_field => format!("hellohappytaxpayerlongtokenblabla{}", i)))
             .is_err()
@@ -96,7 +96,7 @@ fn test_fail_on_flush_segment_but_one_worker_remains() -> tantivy::Result<()> {
     let index = Index::create_in_ram(schema_builder.build());
     let index_writer: IndexWriter = index.writer_with_num_threads(2, 30_000_000)?;
     fail::cfg("FieldSerializer::close_term", "1*return(simulatederror)").unwrap();
-    for i in 0..100_000 {
+    for i in 0..500_000 {
         if index_writer
             .add_document(doc!(text_field => format!("hellohappytaxpayerlongtokenblabla{}", i)))
             .is_err()

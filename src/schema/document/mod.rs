@@ -41,6 +41,7 @@
 //! use tantivy::schema::document::{DeserializeError, DocumentDeserialize, DocumentDeserializer};
 //!
 //! /// Our custom document to let us use a map of `serde_json::Values`.
+//! #[allow(dead_code)]
 //! pub struct MyCustomDocument {
 //!     // Tantivy provides trait implementations for common `serde_json` types.
 //!     fields: BTreeMap<Field, serde_json::Value>
@@ -79,6 +80,7 @@
 //! }
 //!
 //! /// Our custom iterator just helps us to avoid some messy generics.
+//! #[allow(dead_code)]
 //! pub struct MyCustomIter<'a>(btree_map::Iter<'a, Field, serde_json::Value>);
 //! impl<'a> Iterator for MyCustomIter<'a> {
 //!     // Here we can see our field-value pairs being produced by the iterator.
