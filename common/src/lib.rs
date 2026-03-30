@@ -95,6 +95,11 @@ pub fn u64_to_i64(val: u64) -> i64 {
 /// The reverse mapping is [`u64_to_f64()`].
 #[inline]
 pub fn f64_to_u64(val: f64) -> u64 {
+    // Normalize -0.0 to +0.0 so that both encode to the same u64.
+    // IEEE 754 defines -0.0 == +0.0, but their bit patterns differ
+    // (0x8000_0000_0000_0000 vs 0x0), which would produce different
+    // encoded values and break range queries involving zero.
+    let val = if val == 0.0 { 0.0 } else { val };
     let bits = val.to_bits();
     if val.is_sign_positive() {
         bits ^ HIGHEST_BIT
@@ -170,9 +175,11 @@ pub(crate) mod test {
         test_f64_converter_helper(f64::INFINITY);
         test_f64_converter_helper(f64::NEG_INFINITY);
         test_f64_converter_helper(0.0);
-        test_f64_converter_helper(-0.0);
         test_f64_converter_helper(1.0);
         test_f64_converter_helper(-1.0);
+        // -0.0 is normalized to +0.0 by f64_to_u64, so roundtrip yields +0.0
+        assert_eq!(u64_to_f64(f64_to_u64(-0.0)), 0.0);
+        assert!(u64_to_f64(f64_to_u64(-0.0)).is_sign_positive());
     }
 
     #[test]
@@ -186,6 +193,8 @@ pub(crate) mod test {
         assert!(f64_to_u64(-1.5) < f64_to_u64(-1.0));
         assert!(f64_to_u64(-2.0) < f64_to_u64(1.0));
         assert!(f64_to_u64(-2.0) < f64_to_u64(-1.5));
+        // IEEE 754: +0.0 == -0.0, so they must encode to the same u64
+        assert_eq!(f64_to_u64(0.0), f64_to_u64(-0.0));
     }
 
     #[test]
