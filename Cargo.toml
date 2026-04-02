@@ -43,7 +43,7 @@ downcast-rs = "1.2.0"
 bitpacking = { version = "0.8.4", default-features = false, features = [
     "bitpacker4x",
 ] }
-zstd-sys = "=2.0.9"
+zstd-sys = "^2.0.9"
 census = "0.4.0"
 rustc-hash = "1.1.0"
 thiserror = "1.0.30"
