@@ -1,12 +1,9 @@
+use std::any::Any;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use smallvec::smallvec;
-use tokio::task::JoinHandle;
 
-use super::index_writer::{error_in_index_worker_thread, SingletonIndexWriterOptions};
-use super::pool::{get_tokio_indexing_worker_pool, init_pool};
 use super::AddBatch;
 use crate::indexer::merger::MAX_DOC_LIMIT;
 use crate::indexer::operation::AddOperation;
@@ -15,50 +12,24 @@ use crate::indexer::SegmentWriter;
 use crate::schema::document::Document;
 use crate::{Directory, Index, IndexMeta, Opstamp, Segment, TantivyDocument, TantivyError};
 
-struct SingleSegmentWriterState {
-    mem_usage: AtomicUsize,
-    worker_error: Mutex<Option<TantivyError>>,
-    worker_alive: AtomicBool,
-}
-
-impl SingleSegmentWriterState {
-    fn new() -> Self {
-        Self {
-            mem_usage: AtomicUsize::new(0),
-            worker_error: Mutex::new(None),
-            worker_alive: AtomicBool::new(true),
-        }
-    }
-
-    fn record_worker_error(&self, error: &TantivyError) -> crate::Result<()> {
-        let mut worker_error = self.worker_error.lock()?;
-        if worker_error.is_none() {
-            *worker_error = Some(error.clone());
-        }
-        Ok(())
-    }
-
-    fn worker_error(&self) -> crate::Result<Option<TantivyError>> {
-        Ok(self.worker_error.lock()?.clone())
-    }
-}
-
-struct WorkerAliveGuard {
-    state: Arc<SingleSegmentWriterState>,
-}
-
-impl Drop for WorkerAliveGuard {
-    fn drop(&mut self) {
-        self.state.worker_alive.store(false, Ordering::Release);
-    }
+fn panic_to_error(context: &str, panic_payload: Box<dyn Any + Send>) -> TantivyError {
+    let panic_message = if let Some(message) = panic_payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = panic_payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    };
+    TantivyError::ErrorInThread(format!(
+        "Single segment {context} panicked: {panic_message}"
+    ))
 }
 
 #[doc(hidden)]
 pub struct SingleSegmentIndexWriter<D: Document = TantivyDocument> {
     segment: Segment,
-    tx: Arc<async_channel::Sender<AddBatch<D>>>,
-    join_handle: JoinHandle<crate::Result<SegmentWriter>>,
-    state: Arc<SingleSegmentWriterState>,
+    segment_writer: Option<SegmentWriter>,
+    first_error: Option<TantivyError>,
     next_opstamp: Opstamp,
     last_doc_id: Option<u32>,
     _phantom: PhantomData<D>,
@@ -66,36 +37,12 @@ pub struct SingleSegmentIndexWriter<D: Document = TantivyDocument> {
 
 impl<D: Document> SingleSegmentIndexWriter<D> {
     pub fn new(index: Index, mem_budget: usize) -> crate::Result<Self> {
-        let config = SingletonIndexWriterOptions::default();
-        init_pool(config);
-
         let segment = index.new_segment();
-        let mut segment_writer = SegmentWriter::for_segment(mem_budget, segment.clone())?;
-        let (tx, rx) = async_channel::unbounded();
-        let state = Arc::new(SingleSegmentWriterState::new());
-        let worker_state = Arc::clone(&state);
-        let join_handle = get_tokio_indexing_worker_pool().spawn(async move {
-            let _worker_alive_guard = WorkerAliveGuard {
-                state: Arc::clone(&worker_state),
-            };
-            while let Ok(add_operations) = rx.recv().await {
-                for add_operation in add_operations {
-                    if let Err(error) = segment_writer.add_document(add_operation).await {
-                        let _ = worker_state.record_worker_error(&error);
-                        return Err(error);
-                    }
-                }
-                worker_state
-                    .mem_usage
-                    .store(segment_writer.mem_usage(), Ordering::Release);
-            }
-            Ok(segment_writer)
-        });
+        let segment_writer = SegmentWriter::for_segment(mem_budget, segment.clone())?;
         Ok(Self {
             segment,
-            tx: Arc::new(tx),
-            join_handle,
-            state,
+            segment_writer: Some(segment_writer),
+            first_error: None,
             next_opstamp: 0,
             last_doc_id: None,
             _phantom: PhantomData,
@@ -103,13 +50,23 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
     }
 
     pub fn add_document(&mut self, document: D) -> crate::Result<()> {
+        self.ensure_active()?;
+        if self.segment.index().schema().user_specified_doc_id() {
+            return Err(TantivyError::InvalidArgument(
+                "add_document cannot be used when user specified document IDs are enabled"
+                    .to_string(),
+            ));
+        }
+        let next_opstamp = self.next_opstamp.checked_add(1).ok_or_else(|| {
+            TantivyError::InvalidArgument("Document opstamp overflow".to_string())
+        })?;
         let add_operation = AddOperation {
             opstamp: self.next_opstamp,
             document,
             doc_id: None,
         };
-        self.send_batch(smallvec![add_operation])?;
-        self.next_opstamp += 1;
+        self.write_batch(smallvec![add_operation])?;
+        self.next_opstamp = next_opstamp;
         Ok(())
     }
 
@@ -122,6 +79,7 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
         I: IntoIterator<Item = (u32, D)>,
         I::IntoIter: ExactSizeIterator,
     {
+        self.ensure_active()?;
         let documents = documents.into_iter();
         if documents.len() == 0 {
             return Ok(());
@@ -160,96 +118,164 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
                 doc_id: Some(doc_id),
             });
             previous_doc_id = Some(doc_id);
-            next_opstamp += 1;
+            next_opstamp = next_opstamp.checked_add(1).ok_or_else(|| {
+                TantivyError::InvalidArgument("Document opstamp overflow".to_string())
+            })?;
         }
 
-        self.send_batch(add_operations)?;
+        self.write_batch(add_operations)?;
         self.last_doc_id = previous_doc_id;
         self.next_opstamp = next_opstamp;
         Ok(())
     }
 
-    fn send_batch(&self, add_operations: AddBatch<D>) -> crate::Result<()> {
-        if !self.state.worker_alive.load(Ordering::Acquire) {
-            return Err(self
-                .state
-                .worker_error()?
-                .unwrap_or_else(|| error_in_index_worker_thread("An index writer was closed")));
+    fn ensure_active(&self) -> crate::Result<()> {
+        if let Some(error) = &self.first_error {
+            return Err(error.clone());
         }
-
-        let tx = self.tx.clone();
-        if get_tokio_indexing_worker_pool()
-            .block_on(async move { tx.send(add_operations).await })
-            .is_ok()
-        {
-            return Ok(());
+        if self.segment_writer.is_none() {
+            return Err(TantivyError::InternalError(
+                "Single segment writer is unavailable".to_string(),
+            ));
         }
-        Err(self
-            .state
-            .worker_error()?
-            .unwrap_or_else(|| error_in_index_worker_thread("An index writer was closed")))
+        Ok(())
     }
 
-    /// Returns the latest memory usage reported by the indexing worker.
+    fn poison(&mut self, error: TantivyError) -> TantivyError {
+        self.segment_writer.take();
+        self.first_error.get_or_insert(error).clone()
+    }
+
+    fn write_batch(&mut self, add_operations: AddBatch<D>) -> crate::Result<()> {
+        self.ensure_active()?;
+        let mut segment_writer = self.segment_writer.take().ok_or_else(|| {
+            TantivyError::InternalError("Single segment writer is unavailable".to_string())
+        })?;
+        let write_result = catch_unwind(AssertUnwindSafe(|| {
+            futures::executor::block_on(async {
+                for add_operation in add_operations {
+                    segment_writer.add_document(add_operation).await?;
+                }
+                Ok(())
+            })
+        }));
+
+        match write_result {
+            Ok(Ok(())) => {
+                self.segment_writer = Some(segment_writer);
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                drop(segment_writer);
+                let error = self.poison(error);
+                Err(error)
+            }
+            Err(panic_payload) => {
+                drop(segment_writer);
+                let error = self.poison(panic_to_error("document indexing", panic_payload));
+                Err(error)
+            }
+        }
+    }
+
+    /// Returns the active segment writer's current memory usage estimate.
+    ///
+    /// A poisoned writer has dropped its partial segment and reports zero memory usage.
     pub fn mem_usage(&self) -> usize {
-        self.state.mem_usage.load(Ordering::Acquire)
+        self.segment_writer
+            .as_ref()
+            .map(SegmentWriter::mem_usage)
+            .unwrap_or(0)
     }
 
-    pub fn finalize(self) -> crate::Result<Index> {
-        get_tokio_indexing_worker_pool().block_on(async {
-            self.tx.close();
-            let segment_writer = self
-                .join_handle
-                .await
-                .map_err(|_| error_in_index_worker_thread("Worker thread panicked."))??;
+    pub fn finalize(mut self) -> crate::Result<Index> {
+        if let Some(error) = self.first_error {
+            return Err(error);
+        }
+        let segment_writer = self.segment_writer.take().ok_or_else(|| {
+            TantivyError::InternalError("Single segment writer is unavailable".to_string())
+        })?;
+        let max_doc = segment_writer.max_doc();
+        match catch_unwind(AssertUnwindSafe(|| {
+            futures::executor::block_on(segment_writer.finalize())
+        })) {
+            Ok(result) => {
+                result?;
+            }
+            Err(panic_payload) => {
+                return Err(panic_to_error("finalization", panic_payload));
+            }
+        }
 
-            let max_doc = segment_writer.max_doc();
-            segment_writer.finalize().await?;
-            let segment: Segment = self.segment.with_max_doc(max_doc);
-            let index = segment.index();
-            let index_meta = IndexMeta {
-                index_settings: index.settings().clone(),
-                segments: vec![segment.meta().clone()],
-                schema: index.schema(),
-                opstamp: 0,
-                payload: None,
-            };
-            save_metas(&index_meta, index.directory())?;
-            index.directory().sync_directory()?;
-            Ok(segment.index().clone())
-        })
+        let segment: Segment = self.segment.with_max_doc(max_doc);
+        let index = segment.index();
+        let index_meta = IndexMeta {
+            index_settings: index.settings().clone(),
+            segments: vec![segment.meta().clone()],
+            schema: index.schema(),
+            opstamp: 0,
+            payload: None,
+        };
+        save_metas(&index_meta, index.directory())?;
+        index.directory().sync_directory()?;
+        Ok(segment.index().clone())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::thread;
-    use std::time::{Duration, Instant};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
 
     use super::MAX_DOC_LIMIT;
     use crate::collector::DocSetCollector;
     use crate::directory::RamDirectory;
     use crate::query::TermQuery;
-    use crate::schema::{IndexRecordOption, Schema, Term, INDEXED, TEXT, TEXT_WITH_DOC_ID};
-    use crate::{doc, Index, TantivyDocument, TantivyError};
+    use crate::schema::{
+        Document, IndexRecordOption, NumericOptions, Schema, Term, TextFieldIndexing, TextOptions,
+        INDEXED, TEXT, TEXT_WITH_DOC_ID,
+    };
+    use crate::tokenizer::{Token, TokenStream, Tokenizer, TokenizerManager};
+    use crate::{doc, Index, IndexSettings, TantivyDocument, TantivyError};
 
     const MEMORY_BUDGET: usize = 15_000_000;
 
-    fn poll_until<T>(
-        description: &str,
-        mut observe: impl FnMut() -> Option<T>,
-    ) -> crate::Result<T> {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Some(value) = observe() {
-                return Ok(value);
-            }
-            if Instant::now() >= deadline {
-                return Err(TantivyError::SystemError(format!(
-                    "Timed out waiting for {description}"
-                )));
-            }
-            thread::sleep(Duration::from_millis(1));
+    struct PanicDocument;
+
+    impl Document for PanicDocument {
+        type Value<'a> = <TantivyDocument as Document>::Value<'a>;
+        type FieldsValuesIter<'a> = <TantivyDocument as Document>::FieldsValuesIter<'a>;
+
+        fn iter_fields_and_values(&self) -> Self::FieldsValuesIter<'_> {
+            panic!("panic document sentinel");
+        }
+    }
+
+    #[derive(Clone)]
+    struct PanicTokenizer;
+
+    struct UnusedTokenStream {
+        token: Token,
+    }
+
+    impl TokenStream for UnusedTokenStream {
+        fn advance(&mut self) -> bool {
+            false
+        }
+
+        fn token(&self) -> &Token {
+            &self.token
+        }
+
+        fn token_mut(&mut self) -> &mut Token {
+            &mut self.token
+        }
+    }
+
+    impl Tokenizer for PanicTokenizer {
+        type TokenStream<'a> = UnusedTokenStream;
+
+        fn token_stream<'a>(&'a mut self, _text: &'a str) -> Self::TokenStream<'a> {
+            panic!("panic tokenizer sentinel");
         }
     }
 
@@ -283,6 +309,7 @@ mod tests {
     #[test]
     fn test_add_documents_with_sparse_doc_ids() -> crate::Result<()> {
         let (text, directory, mut writer) = user_doc_id_writer()?;
+        let direct_segment_id = writer.segment.id();
 
         writer.add_documents_with_doc_ids(Vec::<(u32, TantivyDocument)>::new())?;
         writer.add_documents_with_doc_ids(vec![
@@ -293,6 +320,9 @@ mod tests {
         writer.finalize()?;
 
         let index = Index::open(directory)?;
+        let segment_metas = index.searchable_segment_metas()?;
+        assert_eq!(segment_metas.len(), 1);
+        assert_eq!(segment_metas[0].id(), direct_segment_id);
         let searcher = index.reader()?.searcher();
         assert_eq!(searcher.segment_readers().len(), 1);
         assert_eq!(searcher.segment_reader(0).max_doc(), 6);
@@ -410,25 +440,30 @@ mod tests {
     }
 
     #[test]
-    fn test_add_document_after_worker_failure_returns_worker_error() -> crate::Result<()> {
+    fn test_add_document_after_failure_returns_first_error() -> crate::Result<()> {
         let (number, mut writer) = schema_error_writer()?;
-        writer.add_document(doc!(number => "not a u64"))?;
+        let first_error = writer
+            .add_document(doc!(number => "not a u64"))
+            .expect_err("the invalid document must fail");
 
-        let error = poll_until("the worker error", || {
-            writer.add_document(TantivyDocument::default()).err()
-        })?;
+        let error = writer
+            .add_document(TantivyDocument::default())
+            .expect_err("the writer must stay poisoned");
 
         assert!(
             matches!(error, TantivyError::SchemaError(_)),
-            "unexpected worker error: {error:?}"
+            "unexpected document error: {error:?}"
         );
+        assert_eq!(error.to_string(), first_error.to_string());
         Ok(())
     }
 
     #[test]
-    fn test_finalize_preserves_worker_error() -> crate::Result<()> {
+    fn test_finalize_preserves_document_error() -> crate::Result<()> {
         let (number, mut writer) = schema_error_writer()?;
-        writer.add_document(doc!(number => "not a u64"))?;
+        let first_error = writer
+            .add_document(doc!(number => "not a u64"))
+            .expect_err("the invalid document must fail");
 
         let error = match writer.finalize() {
             Ok(_) => {
@@ -441,8 +476,9 @@ mod tests {
 
         assert!(
             matches!(error, TantivyError::SchemaError(_)),
-            "unexpected worker error: {error:?}"
+            "unexpected document error: {error:?}"
         );
+        assert_eq!(error.to_string(), first_error.to_string());
         Ok(())
     }
 
@@ -455,13 +491,224 @@ mod tests {
             .single_segment_index_writer(RamDirectory::default(), MEMORY_BUDGET)?;
 
         writer.add_document(doc!(text => "some text to consume indexing memory"))?;
-        let mem_usage = poll_until("non-zero writer memory usage", || {
-            let mem_usage = writer.mem_usage();
-            (mem_usage > 0).then_some(mem_usage)
-        })?;
+        let mem_usage = writer.mem_usage();
 
         assert!(mem_usage > 0);
         writer.finalize()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_document_error_is_returned_by_the_add_call() -> crate::Result<()> {
+        let (number, mut writer) = schema_error_writer()?;
+
+        let error = writer
+            .add_document(doc!(number => "not a u64"))
+            .expect_err("the document error must be returned synchronously");
+
+        assert!(
+            matches!(error, TantivyError::SchemaError(_)),
+            "unexpected document error: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_document_error_poisons_writer_with_first_error() -> crate::Result<()> {
+        let (number, mut writer) = schema_error_writer()?;
+        let index = writer.segment.index().clone();
+
+        let first_error = writer
+            .add_document(doc!(number => "not a u64"))
+            .expect_err("the first invalid document must fail");
+        let second_error = writer
+            .add_document(TantivyDocument::default())
+            .expect_err("a poisoned writer must reject later documents");
+        let empty_batch_error = writer
+            .add_documents_with_doc_ids(Vec::<(u32, TantivyDocument)>::new())
+            .expect_err("a poisoned writer must reject later empty batches");
+
+        assert_eq!(second_error.to_string(), first_error.to_string());
+        assert_eq!(empty_batch_error.to_string(), first_error.to_string());
+        assert_eq!(writer.mem_usage(), 0);
+
+        let finalize_error = match writer.finalize() {
+            Ok(_) => {
+                return Err(TantivyError::SystemError(
+                    "poisoned writer unexpectedly finalized".to_string(),
+                ));
+            }
+            Err(error) => error,
+        };
+        assert_eq!(finalize_error.to_string(), first_error.to_string());
+        assert!(index.load_metas()?.segments.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_batch_document_error_drops_partial_segment_without_publishing_meta() -> crate::Result<()>
+    {
+        let mut schema_builder = Schema::builder();
+        let number =
+            schema_builder.add_u64_field("number", NumericOptions::default().set_indexed());
+        schema_builder.enable_user_specified_doc_id();
+        let directory = RamDirectory::default();
+        let mut writer = Index::builder()
+            .schema(schema_builder.build())
+            .single_segment_index_writer(directory.clone(), MEMORY_BUDGET)?;
+
+        let first_error = writer
+            .add_documents_with_doc_ids(vec![
+                (0, doc!(number => 123u64)),
+                (1, doc!(number => "invalid after first write")),
+            ])
+            .expect_err("the schema error must be returned by the batch call");
+        assert!(matches!(first_error, TantivyError::SchemaError(_)));
+        assert_eq!(writer.mem_usage(), 0);
+
+        let finalize_error = match writer.finalize() {
+            Ok(_) => {
+                return Err(TantivyError::SystemError(
+                    "partially written segment unexpectedly finalized".to_string(),
+                ));
+            }
+            Err(error) => error,
+        };
+        assert_eq!(finalize_error.to_string(), first_error.to_string());
+
+        let index = Index::open(directory)?;
+        assert!(index.load_metas()?.segments.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_document_is_invalid_for_user_doc_id_schema_without_panicking() -> crate::Result<()>
+    {
+        let (text, _directory, mut writer) = user_doc_id_writer()?;
+
+        let call_result = catch_unwind(AssertUnwindSafe(|| {
+            writer.add_document(doc!(text => "missing explicit id"))
+        }));
+        let add_result = call_result.expect("add_document must not panic");
+        let error = add_result.expect_err("add_document must reject user specified ID schemas");
+        assert!(matches!(error, TantivyError::InvalidArgument(_)));
+
+        writer.add_documents_with_doc_ids(vec![(0, doc!(text => "valid"))])?;
+        writer.finalize()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_document_panic_is_captured_and_poisons_writer() -> crate::Result<()> {
+        let mut writer = Index::builder()
+            .schema(Schema::builder().build())
+            .single_segment_index_writer::<PanicDocument>(RamDirectory::default(), MEMORY_BUDGET)?;
+
+        let call_result = catch_unwind(AssertUnwindSafe(|| writer.add_document(PanicDocument)));
+        let add_result = call_result.expect("document panic must not escape add_document");
+        let first_error = add_result.expect_err("document panic must become a Tantivy error");
+        assert!(matches!(first_error, TantivyError::ErrorInThread(_)));
+        assert!(first_error.to_string().contains("panic document sentinel"));
+
+        let second_error = writer
+            .add_document(PanicDocument)
+            .expect_err("panic must poison the writer");
+        assert_eq!(second_error.to_string(), first_error.to_string());
+        Ok(())
+    }
+
+    #[test]
+    fn test_tokenizer_panic_is_captured_and_poisons_writer() -> crate::Result<()> {
+        let text_options = TextOptions::default().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("panic")
+                .set_index_option(IndexRecordOption::Basic),
+        );
+        let mut schema_builder = Schema::builder();
+        let text = schema_builder.add_text_field("text", text_options);
+        let tokenizers = TokenizerManager::default();
+        tokenizers.register("panic", PanicTokenizer);
+        let mut writer = Index::builder()
+            .schema(schema_builder.build())
+            .tokenizers(tokenizers)
+            .single_segment_index_writer::<TantivyDocument>(
+                RamDirectory::default(),
+                MEMORY_BUDGET,
+            )?;
+
+        let call_result = catch_unwind(AssertUnwindSafe(|| {
+            writer.add_document(doc!(text => "panic"))
+        }));
+        let add_result = call_result.expect("tokenizer panic must not escape add_document");
+        let first_error = add_result.expect_err("tokenizer panic must become a Tantivy error");
+        assert!(matches!(first_error, TantivyError::ErrorInThread(_)));
+        assert!(first_error.to_string().contains("panic tokenizer sentinel"));
+
+        let second_error = writer
+            .add_document(TantivyDocument::default())
+            .expect_err("tokenizer panic must poison the writer");
+        assert_eq!(second_error.to_string(), first_error.to_string());
+        Ok(())
+    }
+
+    #[test]
+    fn test_mem_usage_is_available_synchronously() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        schema_builder.add_text_field("text", TEXT);
+        let writer = Index::builder()
+            .schema(schema_builder.build())
+            .single_segment_index_writer::<TantivyDocument>(
+                RamDirectory::default(),
+                MEMORY_BUDGET,
+            )?;
+
+        assert!(writer.mem_usage() > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_opstamp_overflow_is_prevalidated_without_poisoning() -> crate::Result<()> {
+        let (text, _directory, mut writer) = user_doc_id_writer()?;
+        writer.next_opstamp = u64::MAX;
+
+        let call_result = catch_unwind(AssertUnwindSafe(|| {
+            writer.add_documents_with_doc_ids(vec![(0, doc!(text => "overflow"))])
+        }));
+        let add_result = call_result.expect("opstamp validation must not panic");
+        let error = add_result.expect_err("opstamp overflow must be rejected");
+        assert!(matches!(error, TantivyError::InvalidArgument(_)));
+        assert_eq!(writer.next_opstamp, u64::MAX);
+
+        writer.next_opstamp = 0;
+        writer.add_documents_with_doc_ids(vec![(0, doc!(text => "valid"))])?;
+        writer.finalize()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_finalize_preserves_settings_schema_and_meta_contract() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text = schema_builder.add_text_field("text", TEXT);
+        let schema = schema_builder.build();
+        let mut settings = IndexSettings::default();
+        settings.docstore_blocksize = 4_096;
+        let directory = RamDirectory::default();
+        let mut writer = Index::builder()
+            .schema(schema.clone())
+            .settings(settings.clone())
+            .single_segment_index_writer(directory.clone(), MEMORY_BUDGET)?;
+
+        writer.add_document(doc!(text => "meta"))?;
+        writer.finalize()?;
+
+        let index = Index::open(directory)?;
+        let meta = index.load_metas()?;
+        assert_eq!(meta.segments.len(), 1);
+        assert_eq!(meta.segments[0].max_doc(), 1);
+        assert_eq!(meta.index_settings, settings);
+        assert_eq!(meta.schema, schema);
+        assert_eq!(meta.opstamp, 0);
+        assert_eq!(meta.payload, None);
         Ok(())
     }
 }
