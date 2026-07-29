@@ -159,7 +159,7 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
             TantivyError::InternalError("Single segment writer is unavailable".to_string())
         })?;
         let write_result = catch_unwind(AssertUnwindSafe(|| {
-            futures::executor::block_on(async {
+            futures_executor::block_on(async {
                 for add_operation in add_operations {
                     segment_writer.add_document(add_operation).await?;
                 }
@@ -204,7 +204,7 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
         })?;
         let max_doc = segment_writer.max_doc();
         match catch_unwind(AssertUnwindSafe(|| {
-            futures::executor::block_on(segment_writer.finalize())
+            futures_executor::block_on(segment_writer.finalize())
         })) {
             Ok(result) => {
                 result?;
