@@ -1,21 +1,25 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use smallvec::smallvec;
 use tokio::task::JoinHandle;
 
 use super::index_writer::{error_in_index_worker_thread, SingletonIndexWriterOptions};
 use super::pool::{get_tokio_indexing_worker_pool, init_pool};
+use super::AddBatch;
 use crate::indexer::operation::AddOperation;
 use crate::indexer::segment_updater::save_metas;
 use crate::indexer::SegmentWriter;
 use crate::schema::document::Document;
-use crate::{Directory, Index, IndexMeta, Segment, TantivyDocument};
+use crate::{Directory, Index, IndexMeta, Opstamp, Segment, TantivyDocument, TantivyError};
 
 #[doc(hidden)]
 pub struct SingleSegmentIndexWriter<D: Document = TantivyDocument> {
     segment: Segment,
-    tx: Arc<async_channel::Sender<D>>,
+    tx: Arc<async_channel::Sender<AddBatch<D>>>,
     join_handle: JoinHandle<crate::Result<SegmentWriter>>,
+    next_opstamp: Opstamp,
+    last_doc_id: Option<u32>,
     _phantom: PhantomData<D>,
 }
 
@@ -28,16 +32,10 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
         let mut segment_writer = SegmentWriter::for_segment(mem_budget, segment.clone())?;
         let (tx, rx) = async_channel::unbounded();
         let join_handle = get_tokio_indexing_worker_pool().spawn(async move {
-            let mut opstamp = 0;
-            while let Ok(document) = rx.recv().await {
-                segment_writer
-                    .add_document(AddOperation {
-                        opstamp,
-                        document,
-                        doc_id: None,
-                    })
-                    .await?;
-                opstamp += 1;
+            while let Ok(add_operations) = rx.recv().await {
+                for add_operation in add_operations {
+                    segment_writer.add_document(add_operation).await?;
+                }
             }
             Ok(segment_writer)
         });
@@ -45,14 +43,74 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
             segment,
             tx: Arc::new(tx),
             join_handle,
+            next_opstamp: 0,
+            last_doc_id: None,
             _phantom: PhantomData,
         })
     }
 
     pub fn add_document(&mut self, document: D) -> crate::Result<()> {
+        let add_operation = AddOperation {
+            opstamp: self.next_opstamp,
+            document,
+            doc_id: None,
+        };
+        self.send_batch(smallvec![add_operation])?;
+        self.next_opstamp += 1;
+        Ok(())
+    }
+
+    /// Adds a batch of documents with user-specified document IDs.
+    ///
+    /// Document IDs must be strictly increasing across and within batches. Sparse document IDs are
+    /// allowed.
+    pub fn add_documents_with_doc_ids<I>(&mut self, documents: I) -> crate::Result<()>
+    where
+        I: IntoIterator<Item = (u32, D)>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let documents = documents.into_iter();
+        if documents.len() == 0 {
+            return Ok(());
+        }
+        if !self.segment.index().schema().user_specified_doc_id() {
+            return Err(TantivyError::InvalidArgument(
+                "User specified id is not enabled".to_string(),
+            ));
+        }
+
+        let mut add_operations = AddBatch::with_capacity(documents.len());
+        let mut previous_doc_id = self.last_doc_id;
+        let mut next_opstamp = self.next_opstamp;
+        for (doc_id, document) in documents {
+            if let Some(previous_doc_id) = previous_doc_id {
+                if doc_id <= previous_doc_id {
+                    return Err(TantivyError::InvalidArgument(format!(
+                        "Document ID must be strictly ordered: previous doc id {}, current doc id \
+                         {}",
+                        previous_doc_id, doc_id,
+                    )));
+                }
+            }
+            add_operations.push(AddOperation {
+                opstamp: next_opstamp,
+                document,
+                doc_id: Some(doc_id),
+            });
+            previous_doc_id = Some(doc_id);
+            next_opstamp += 1;
+        }
+
+        self.send_batch(add_operations)?;
+        self.last_doc_id = previous_doc_id;
+        self.next_opstamp = next_opstamp;
+        Ok(())
+    }
+
+    fn send_batch(&self, add_operations: AddBatch<D>) -> crate::Result<()> {
         let tx = self.tx.clone();
         if get_tokio_indexing_worker_pool()
-            .block_on(async move { tx.send(document).await })
+            .block_on(async move { tx.send(add_operations).await })
             .is_ok()
         {
             return Ok(());
@@ -86,5 +144,121 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
             index.directory().sync_directory()?;
             Ok(segment.index().clone())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::collector::DocSetCollector;
+    use crate::directory::RamDirectory;
+    use crate::query::TermQuery;
+    use crate::schema::{IndexRecordOption, Schema, Term, TEXT, TEXT_WITH_DOC_ID};
+    use crate::{doc, Index, TantivyDocument, TantivyError};
+
+    const MEMORY_BUDGET: usize = 15_000_000;
+
+    fn user_doc_id_writer() -> crate::Result<(
+        crate::schema::Field,
+        RamDirectory,
+        super::SingleSegmentIndexWriter<TantivyDocument>,
+    )> {
+        let mut schema_builder = Schema::builder();
+        let text = schema_builder.add_text_field("text", TEXT_WITH_DOC_ID);
+        schema_builder.enable_user_specified_doc_id();
+        let directory = RamDirectory::default();
+        let writer = Index::builder()
+            .schema(schema_builder.build())
+            .single_segment_index_writer(directory.clone(), MEMORY_BUDGET)?;
+        Ok((text, directory, writer))
+    }
+
+    #[test]
+    fn test_add_documents_with_sparse_doc_ids() -> crate::Result<()> {
+        let (text, directory, mut writer) = user_doc_id_writer()?;
+
+        writer.add_documents_with_doc_ids(Vec::<(u32, TantivyDocument)>::new())?;
+        writer.add_documents_with_doc_ids(vec![
+            (0, doc!(text => "shared")),
+            (2, doc!(text => "shared")),
+            (5, doc!(text => "shared")),
+        ])?;
+        writer.finalize()?;
+
+        let index = Index::open(directory)?;
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        assert_eq!(searcher.segment_reader(0).max_doc(), 6);
+
+        let term_query = TermQuery::new(
+            Term::from_field_text(text, "shared"),
+            IndexRecordOption::Basic,
+        );
+        let mut doc_ids: Vec<u32> = searcher
+            .search(&term_query, &DocSetCollector)?
+            .into_iter()
+            .map(|doc_address| doc_address.doc_id)
+            .collect();
+        doc_ids.sort_unstable();
+        assert_eq!(doc_ids, [0, 2, 5]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_documents_with_duplicate_doc_ids_is_invalid() -> crate::Result<()> {
+        let (text, _directory, mut writer) = user_doc_id_writer()?;
+
+        let error = writer
+            .add_documents_with_doc_ids(vec![
+                (2, doc!(text => "first")),
+                (2, doc!(text => "duplicate")),
+            ])
+            .unwrap_err();
+        assert!(matches!(error, TantivyError::InvalidArgument(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_documents_with_descending_doc_ids_is_invalid() -> crate::Result<()> {
+        let (text, _directory, mut writer) = user_doc_id_writer()?;
+
+        let error = writer
+            .add_documents_with_doc_ids(vec![
+                (5, doc!(text => "first")),
+                (2, doc!(text => "descending")),
+            ])
+            .unwrap_err();
+        assert!(matches!(error, TantivyError::InvalidArgument(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_documents_with_doc_ids_must_increase_across_batches() -> crate::Result<()> {
+        let (text, _directory, mut writer) = user_doc_id_writer()?;
+
+        writer.add_documents_with_doc_ids(vec![(5, doc!(text => "first"))])?;
+
+        for doc_id in [5, 2] {
+            let error = writer
+                .add_documents_with_doc_ids(vec![(doc_id, doc!(text => "invalid"))])
+                .unwrap_err();
+            assert!(matches!(error, TantivyError::InvalidArgument(_)));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_documents_with_doc_ids_requires_user_doc_id_schema() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text = schema_builder.add_text_field("text", TEXT);
+        let directory = RamDirectory::default();
+        let mut writer = Index::builder()
+            .schema(schema_builder.build())
+            .single_segment_index_writer(directory, MEMORY_BUDGET)?;
+
+        let error = writer
+            .add_documents_with_doc_ids(vec![(0, doc!(text => "invalid"))])
+            .unwrap_err();
+        assert!(matches!(error, TantivyError::InvalidArgument(_)));
+        Ok(())
     }
 }
