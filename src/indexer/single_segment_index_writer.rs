@@ -7,6 +7,7 @@ use tokio::task::JoinHandle;
 use super::index_writer::{error_in_index_worker_thread, SingletonIndexWriterOptions};
 use super::pool::{get_tokio_indexing_worker_pool, init_pool};
 use super::AddBatch;
+use crate::indexer::merger::MAX_DOC_LIMIT;
 use crate::indexer::operation::AddOperation;
 use crate::indexer::segment_updater::save_metas;
 use crate::indexer::SegmentWriter;
@@ -83,6 +84,15 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
         let mut previous_doc_id = self.last_doc_id;
         let mut next_opstamp = self.next_opstamp;
         for (doc_id, document) in documents {
+            match doc_id.checked_add(1) {
+                Some(max_doc) if max_doc < MAX_DOC_LIMIT => {}
+                _ => {
+                    return Err(TantivyError::InvalidArgument(format!(
+                        "Document ID {doc_id} is out of range: resulting max doc must be less \
+                         than {MAX_DOC_LIMIT}"
+                    )));
+                }
+            }
             if let Some(previous_doc_id) = previous_doc_id {
                 if doc_id <= previous_doc_id {
                     return Err(TantivyError::InvalidArgument(format!(
@@ -149,6 +159,7 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
 
 #[cfg(test)]
 mod tests {
+    use super::MAX_DOC_LIMIT;
     use crate::collector::DocSetCollector;
     use crate::directory::RamDirectory;
     use crate::query::TermQuery;
@@ -257,6 +268,45 @@ mod tests {
 
         let error = writer
             .add_documents_with_doc_ids(vec![(0, doc!(text => "invalid"))])
+            .unwrap_err();
+        assert!(matches!(error, TantivyError::InvalidArgument(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_documents_with_doc_ids_accepts_max_doc_boundary() -> crate::Result<()> {
+        let (_text, _directory, mut writer) = user_doc_id_writer()?;
+
+        writer.add_documents_with_doc_ids(vec![(MAX_DOC_LIMIT - 2, TantivyDocument::default())])?;
+        let index = writer.finalize()?;
+
+        let segment_metas = index.searchable_segment_metas()?;
+        assert_eq!(segment_metas.len(), 1);
+        assert_eq!(segment_metas[0].max_doc(), MAX_DOC_LIMIT - 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_documents_with_doc_ids_rejects_max_doc_limit() -> crate::Result<()> {
+        let (_text, _directory, mut writer) = user_doc_id_writer()?;
+
+        let error = writer
+            .add_documents_with_doc_ids(vec![
+                (0, TantivyDocument::default()),
+                (MAX_DOC_LIMIT - 1, TantivyDocument::default()),
+            ])
+            .unwrap_err();
+        assert!(matches!(error, TantivyError::InvalidArgument(_)));
+        writer.add_documents_with_doc_ids(vec![(0, TantivyDocument::default())])?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_documents_with_doc_ids_rejects_u32_max() -> crate::Result<()> {
+        let (_text, _directory, mut writer) = user_doc_id_writer()?;
+
+        let error = writer
+            .add_documents_with_doc_ids(vec![(u32::MAX, TantivyDocument::default())])
             .unwrap_err();
         assert!(matches!(error, TantivyError::InvalidArgument(_)));
         Ok(())
