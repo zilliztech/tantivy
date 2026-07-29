@@ -36,7 +36,8 @@ pub struct SingleSegmentIndexWriter<D: Document = TantivyDocument> {
 }
 
 impl<D: Document> SingleSegmentIndexWriter<D> {
-    pub fn new(index: Index, mem_budget: usize) -> crate::Result<Self> {
+    pub fn new(mut index: Index, mem_budget: usize) -> crate::Result<Self> {
+        index.settings_mut().docstore_compress_dedicated_thread = false;
         let segment = index.new_segment();
         let segment_writer = SegmentWriter::for_segment(mem_budget, segment.clone())?;
         Ok(Self {
@@ -60,6 +61,12 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
         let next_opstamp = self.next_opstamp.checked_add(1).ok_or_else(|| {
             TantivyError::InvalidArgument("Document opstamp overflow".to_string())
         })?;
+        if next_opstamp >= Opstamp::from(MAX_DOC_LIMIT) {
+            return Err(TantivyError::InvalidArgument(format!(
+                "Document ID {} is out of range: resulting max doc must be less than {}",
+                self.next_opstamp, MAX_DOC_LIMIT
+            )));
+        }
         let add_operation = AddOperation {
             opstamp: self.next_opstamp,
             document,
@@ -440,6 +447,41 @@ mod tests {
     }
 
     #[test]
+    fn test_add_document_rejects_max_doc_limit_atomically() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text = schema_builder.add_text_field("text", TEXT);
+        let mut writer = Index::builder()
+            .schema(schema_builder.build())
+            .single_segment_index_writer(RamDirectory::default(), MEMORY_BUDGET)?;
+        writer.next_opstamp = u64::from(MAX_DOC_LIMIT - 1);
+        let max_doc_before = writer
+            .segment_writer
+            .as_ref()
+            .expect("writer must be active")
+            .max_doc();
+
+        let error = writer
+            .add_document(doc!(text => "out of range"))
+            .expect_err("resulting max doc at MAX_DOC_LIMIT must be rejected");
+
+        assert!(matches!(error, TantivyError::InvalidArgument(_)));
+        assert_eq!(writer.next_opstamp, u64::from(MAX_DOC_LIMIT - 1));
+        assert_eq!(
+            writer
+                .segment_writer
+                .as_ref()
+                .expect("validation errors must not poison the writer")
+                .max_doc(),
+            max_doc_before
+        );
+
+        writer.next_opstamp = 0;
+        writer.add_document(doc!(text => "valid"))?;
+        writer.finalize()?;
+        Ok(())
+    }
+
+    #[test]
     fn test_add_document_after_failure_returns_first_error() -> crate::Result<()> {
         let (number, mut writer) = schema_error_writer()?;
         let first_error = writer
@@ -667,6 +709,25 @@ mod tests {
     }
 
     #[test]
+    fn test_default_writer_disables_dedicated_docstore_compression() -> crate::Result<()> {
+        let writer = Index::builder()
+            .schema(Schema::builder().build())
+            .single_segment_index_writer::<TantivyDocument>(
+                RamDirectory::default(),
+                MEMORY_BUDGET,
+            )?;
+
+        assert!(
+            !writer
+                .segment
+                .index()
+                .settings()
+                .docstore_compress_dedicated_thread
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_opstamp_overflow_is_prevalidated_without_poisoning() -> crate::Result<()> {
         let (text, _directory, mut writer) = user_doc_id_writer()?;
         writer.next_opstamp = u64::MAX;
@@ -692,6 +753,8 @@ mod tests {
         let schema = schema_builder.build();
         let mut settings = IndexSettings::default();
         settings.docstore_blocksize = 4_096;
+        let mut expected_settings = settings.clone();
+        expected_settings.docstore_compress_dedicated_thread = false;
         let directory = RamDirectory::default();
         let mut writer = Index::builder()
             .schema(schema.clone())
@@ -705,7 +768,7 @@ mod tests {
         let meta = index.load_metas()?;
         assert_eq!(meta.segments.len(), 1);
         assert_eq!(meta.segments[0].max_doc(), 1);
-        assert_eq!(meta.index_settings, settings);
+        assert_eq!(meta.index_settings, expected_settings);
         assert_eq!(meta.schema, schema);
         assert_eq!(meta.opstamp, 0);
         assert_eq!(meta.payload, None);
