@@ -1,5 +1,6 @@
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use smallvec::smallvec;
 use tokio::task::JoinHandle;
@@ -14,11 +15,50 @@ use crate::indexer::SegmentWriter;
 use crate::schema::document::Document;
 use crate::{Directory, Index, IndexMeta, Opstamp, Segment, TantivyDocument, TantivyError};
 
+struct SingleSegmentWriterState {
+    mem_usage: AtomicUsize,
+    worker_error: Mutex<Option<TantivyError>>,
+    worker_alive: AtomicBool,
+}
+
+impl SingleSegmentWriterState {
+    fn new() -> Self {
+        Self {
+            mem_usage: AtomicUsize::new(0),
+            worker_error: Mutex::new(None),
+            worker_alive: AtomicBool::new(true),
+        }
+    }
+
+    fn record_worker_error(&self, error: &TantivyError) -> crate::Result<()> {
+        let mut worker_error = self.worker_error.lock()?;
+        if worker_error.is_none() {
+            *worker_error = Some(error.clone());
+        }
+        Ok(())
+    }
+
+    fn worker_error(&self) -> crate::Result<Option<TantivyError>> {
+        Ok(self.worker_error.lock()?.clone())
+    }
+}
+
+struct WorkerAliveGuard {
+    state: Arc<SingleSegmentWriterState>,
+}
+
+impl Drop for WorkerAliveGuard {
+    fn drop(&mut self) {
+        self.state.worker_alive.store(false, Ordering::Release);
+    }
+}
+
 #[doc(hidden)]
 pub struct SingleSegmentIndexWriter<D: Document = TantivyDocument> {
     segment: Segment,
     tx: Arc<async_channel::Sender<AddBatch<D>>>,
     join_handle: JoinHandle<crate::Result<SegmentWriter>>,
+    state: Arc<SingleSegmentWriterState>,
     next_opstamp: Opstamp,
     last_doc_id: Option<u32>,
     _phantom: PhantomData<D>,
@@ -32,11 +72,22 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
         let segment = index.new_segment();
         let mut segment_writer = SegmentWriter::for_segment(mem_budget, segment.clone())?;
         let (tx, rx) = async_channel::unbounded();
+        let state = Arc::new(SingleSegmentWriterState::new());
+        let worker_state = Arc::clone(&state);
         let join_handle = get_tokio_indexing_worker_pool().spawn(async move {
+            let _worker_alive_guard = WorkerAliveGuard {
+                state: Arc::clone(&worker_state),
+            };
             while let Ok(add_operations) = rx.recv().await {
                 for add_operation in add_operations {
-                    segment_writer.add_document(add_operation).await?;
+                    if let Err(error) = segment_writer.add_document(add_operation).await {
+                        let _ = worker_state.record_worker_error(&error);
+                        return Err(error);
+                    }
                 }
+                worker_state
+                    .mem_usage
+                    .store(segment_writer.mem_usage(), Ordering::Release);
             }
             Ok(segment_writer)
         });
@@ -44,6 +95,7 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
             segment,
             tx: Arc::new(tx),
             join_handle,
+            state,
             next_opstamp: 0,
             last_doc_id: None,
             _phantom: PhantomData,
@@ -118,6 +170,13 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
     }
 
     fn send_batch(&self, add_operations: AddBatch<D>) -> crate::Result<()> {
+        if !self.state.worker_alive.load(Ordering::Acquire) {
+            return Err(self
+                .state
+                .worker_error()?
+                .unwrap_or_else(|| error_in_index_worker_thread("An index writer was closed")));
+        }
+
         let tx = self.tx.clone();
         if get_tokio_indexing_worker_pool()
             .block_on(async move { tx.send(add_operations).await })
@@ -125,9 +184,15 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
         {
             return Ok(());
         }
-        Err(error_in_index_worker_thread(
-            "An index writer encounter erros.",
-        ))
+        Err(self
+            .state
+            .worker_error()?
+            .unwrap_or_else(|| error_in_index_worker_thread("An index writer was closed")))
+    }
+
+    /// Returns the latest memory usage reported by the indexing worker.
+    pub fn mem_usage(&self) -> usize {
+        self.state.mem_usage.load(Ordering::Acquire)
     }
 
     pub fn finalize(self) -> crate::Result<Index> {
@@ -136,8 +201,7 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
             let segment_writer = self
                 .join_handle
                 .await
-                .map_err(|_| error_in_index_worker_thread("Worker thread panicked."))?
-                .map_err(|_| error_in_index_worker_thread("Worker thread failed."))?;
+                .map_err(|_| error_in_index_worker_thread("Worker thread panicked."))??;
 
             let max_doc = segment_writer.max_doc();
             segment_writer.finalize().await?;
@@ -159,14 +223,47 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+    use std::time::{Duration, Instant};
+
     use super::MAX_DOC_LIMIT;
     use crate::collector::DocSetCollector;
     use crate::directory::RamDirectory;
     use crate::query::TermQuery;
-    use crate::schema::{IndexRecordOption, Schema, Term, TEXT, TEXT_WITH_DOC_ID};
+    use crate::schema::{IndexRecordOption, Schema, Term, INDEXED, TEXT, TEXT_WITH_DOC_ID};
     use crate::{doc, Index, TantivyDocument, TantivyError};
 
     const MEMORY_BUDGET: usize = 15_000_000;
+
+    fn poll_until<T>(
+        description: &str,
+        mut observe: impl FnMut() -> Option<T>,
+    ) -> crate::Result<T> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(value) = observe() {
+                return Ok(value);
+            }
+            if Instant::now() >= deadline {
+                return Err(TantivyError::SystemError(format!(
+                    "Timed out waiting for {description}"
+                )));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn schema_error_writer() -> crate::Result<(
+        crate::schema::Field,
+        super::SingleSegmentIndexWriter<TantivyDocument>,
+    )> {
+        let mut schema_builder = Schema::builder();
+        let number = schema_builder.add_u64_field("number", INDEXED);
+        let writer = Index::builder()
+            .schema(schema_builder.build())
+            .single_segment_index_writer(RamDirectory::default(), MEMORY_BUDGET)?;
+        Ok((number, writer))
+    }
 
     fn user_doc_id_writer() -> crate::Result<(
         crate::schema::Field,
@@ -309,6 +406,62 @@ mod tests {
             .add_documents_with_doc_ids(vec![(u32::MAX, TantivyDocument::default())])
             .unwrap_err();
         assert!(matches!(error, TantivyError::InvalidArgument(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_document_after_worker_failure_returns_worker_error() -> crate::Result<()> {
+        let (number, mut writer) = schema_error_writer()?;
+        writer.add_document(doc!(number => "not a u64"))?;
+
+        let error = poll_until("the worker error", || {
+            writer.add_document(TantivyDocument::default()).err()
+        })?;
+
+        assert!(
+            matches!(error, TantivyError::SchemaError(_)),
+            "unexpected worker error: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_finalize_preserves_worker_error() -> crate::Result<()> {
+        let (number, mut writer) = schema_error_writer()?;
+        writer.add_document(doc!(number => "not a u64"))?;
+
+        let error = match writer.finalize() {
+            Ok(_) => {
+                return Err(TantivyError::SystemError(
+                    "finalize unexpectedly succeeded".to_string(),
+                ));
+            }
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, TantivyError::SchemaError(_)),
+            "unexpected worker error: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_mem_usage_is_updated_after_batch_is_processed() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text = schema_builder.add_text_field("text", TEXT);
+        let mut writer = Index::builder()
+            .schema(schema_builder.build())
+            .single_segment_index_writer(RamDirectory::default(), MEMORY_BUDGET)?;
+
+        writer.add_document(doc!(text => "some text to consume indexing memory"))?;
+        let mem_usage = poll_until("non-zero writer memory usage", || {
+            let mem_usage = writer.mem_usage();
+            (mem_usage > 0).then_some(mem_usage)
+        })?;
+
+        assert!(mem_usage > 0);
+        writer.finalize()?;
         Ok(())
     }
 }
