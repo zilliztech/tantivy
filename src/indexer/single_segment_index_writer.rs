@@ -10,7 +10,9 @@ use crate::indexer::operation::AddOperation;
 use crate::indexer::segment_updater::save_metas;
 use crate::indexer::SegmentWriter;
 use crate::schema::document::Document;
-use crate::{Directory, Index, IndexMeta, Opstamp, Segment, TantivyDocument, TantivyError};
+use crate::{
+    Directory, Index, IndexMeta, IndexSettings, Opstamp, Segment, TantivyDocument, TantivyError,
+};
 
 fn panic_to_error(context: &str, panic_payload: Box<dyn Any + Send>) -> TantivyError {
     let panic_message = if let Some(message) = panic_payload.downcast_ref::<&str>() {
@@ -28,6 +30,7 @@ fn panic_to_error(context: &str, panic_payload: Box<dyn Any + Send>) -> TantivyE
 #[doc(hidden)]
 pub struct SingleSegmentIndexWriter<D: Document = TantivyDocument> {
     segment: Segment,
+    index_settings: IndexSettings,
     segment_writer: Option<SegmentWriter>,
     first_error: Option<TantivyError>,
     next_opstamp: Opstamp,
@@ -37,11 +40,13 @@ pub struct SingleSegmentIndexWriter<D: Document = TantivyDocument> {
 
 impl<D: Document> SingleSegmentIndexWriter<D> {
     pub fn new(mut index: Index, mem_budget: usize) -> crate::Result<Self> {
+        let index_settings = index.settings().clone();
         index.settings_mut().docstore_compress_dedicated_thread = false;
         let segment = index.new_segment();
         let segment_writer = SegmentWriter::for_segment(mem_budget, segment.clone())?;
         Ok(Self {
             segment,
+            index_settings,
             segment_writer: Some(segment_writer),
             first_error: None,
             next_opstamp: 0,
@@ -185,16 +190,6 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
         }
     }
 
-    /// Returns the active segment writer's current memory usage estimate.
-    ///
-    /// A poisoned writer has dropped its partial segment and reports zero memory usage.
-    pub fn mem_usage(&self) -> usize {
-        self.segment_writer
-            .as_ref()
-            .map(SegmentWriter::mem_usage)
-            .unwrap_or(0)
-    }
-
     pub fn finalize(mut self) -> crate::Result<Index> {
         if let Some(error) = self.first_error {
             return Err(error);
@@ -216,8 +211,9 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
 
         let segment: Segment = self.segment.with_max_doc(max_doc);
         let index = segment.index();
+        let index_settings = self.index_settings;
         let index_meta = IndexMeta {
-            index_settings: index.settings().clone(),
+            index_settings: index_settings.clone(),
             segments: vec![segment.meta().clone()],
             schema: index.schema(),
             opstamp: 0,
@@ -225,7 +221,9 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
         };
         save_metas(&index_meta, index.directory())?;
         index.directory().sync_directory()?;
-        Ok(segment.index().clone())
+        let mut finalized_index = segment.index().clone();
+        *finalized_index.settings_mut() = index_settings;
+        Ok(finalized_index)
     }
 }
 
@@ -525,22 +523,6 @@ mod tests {
     }
 
     #[test]
-    fn test_mem_usage_is_updated_after_batch_is_processed() -> crate::Result<()> {
-        let mut schema_builder = Schema::builder();
-        let text = schema_builder.add_text_field("text", TEXT);
-        let mut writer = Index::builder()
-            .schema(schema_builder.build())
-            .single_segment_index_writer(RamDirectory::default(), MEMORY_BUDGET)?;
-
-        writer.add_document(doc!(text => "some text to consume indexing memory"))?;
-        let mem_usage = writer.mem_usage();
-
-        assert!(mem_usage > 0);
-        writer.finalize()?;
-        Ok(())
-    }
-
-    #[test]
     fn test_document_error_is_returned_by_the_add_call() -> crate::Result<()> {
         let (number, mut writer) = schema_error_writer()?;
 
@@ -572,7 +554,7 @@ mod tests {
 
         assert_eq!(second_error.to_string(), first_error.to_string());
         assert_eq!(empty_batch_error.to_string(), first_error.to_string());
-        assert_eq!(writer.mem_usage(), 0);
+        assert!(writer.segment_writer.is_none());
 
         let finalize_error = match writer.finalize() {
             Ok(_) => {
@@ -606,7 +588,7 @@ mod tests {
             ])
             .expect_err("the schema error must be returned by the batch call");
         assert!(matches!(first_error, TantivyError::SchemaError(_)));
-        assert_eq!(writer.mem_usage(), 0);
+        assert!(writer.segment_writer.is_none());
 
         let finalize_error = match writer.finalize() {
             Ok(_) => {
@@ -694,21 +676,6 @@ mod tests {
     }
 
     #[test]
-    fn test_mem_usage_is_available_synchronously() -> crate::Result<()> {
-        let mut schema_builder = Schema::builder();
-        schema_builder.add_text_field("text", TEXT);
-        let writer = Index::builder()
-            .schema(schema_builder.build())
-            .single_segment_index_writer::<TantivyDocument>(
-                RamDirectory::default(),
-                MEMORY_BUDGET,
-            )?;
-
-        assert!(writer.mem_usage() > 0);
-        Ok(())
-    }
-
-    #[test]
     fn test_default_writer_disables_dedicated_docstore_compression() -> crate::Result<()> {
         let writer = Index::builder()
             .schema(Schema::builder().build())
@@ -753,8 +720,6 @@ mod tests {
         let schema = schema_builder.build();
         let mut settings = IndexSettings::default();
         settings.docstore_blocksize = 4_096;
-        let mut expected_settings = settings.clone();
-        expected_settings.docstore_compress_dedicated_thread = false;
         let directory = RamDirectory::default();
         let mut writer = Index::builder()
             .schema(schema.clone())
@@ -762,13 +727,14 @@ mod tests {
             .single_segment_index_writer(directory.clone(), MEMORY_BUDGET)?;
 
         writer.add_document(doc!(text => "meta"))?;
-        writer.finalize()?;
+        let finalized_index = writer.finalize()?;
+        assert_eq!(finalized_index.settings(), &settings);
 
         let index = Index::open(directory)?;
         let meta = index.load_metas()?;
         assert_eq!(meta.segments.len(), 1);
         assert_eq!(meta.segments[0].max_doc(), 1);
-        assert_eq!(meta.index_settings, expected_settings);
+        assert_eq!(meta.index_settings, settings);
         assert_eq!(meta.schema, schema);
         assert_eq!(meta.opstamp, 0);
         assert_eq!(meta.payload, None);
