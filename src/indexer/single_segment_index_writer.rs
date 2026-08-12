@@ -82,6 +82,59 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
         Ok(())
     }
 
+    /// Adds a batch of documents with sequential document IDs.
+    pub fn add_documents<I>(&mut self, documents: I) -> crate::Result<()>
+    where
+        I: IntoIterator<Item = D>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        self.ensure_active()?;
+        let documents = documents.into_iter();
+        if documents.len() == 0 {
+            return Ok(());
+        }
+        if self.segment.index().schema().user_specified_doc_id() {
+            return Err(TantivyError::InvalidArgument(
+                "add_documents cannot be used when user specified document IDs are enabled"
+                    .to_string(),
+            ));
+        }
+
+        let document_count = Opstamp::try_from(documents.len()).map_err(|_| {
+            TantivyError::InvalidArgument("Document batch length overflow".to_string())
+        })?;
+        let next_opstamp = self
+            .next_opstamp
+            .checked_add(document_count)
+            .ok_or_else(|| {
+                TantivyError::InvalidArgument("Document opstamp overflow".to_string())
+            })?;
+        if next_opstamp >= Opstamp::from(MAX_DOC_LIMIT) {
+            return Err(TantivyError::InvalidArgument(format!(
+                "Document ID {} is out of range: resulting max doc must be less than {}",
+                next_opstamp - 1,
+                MAX_DOC_LIMIT
+            )));
+        }
+
+        let mut add_operations = AddBatch::with_capacity(documents.len());
+        let mut opstamp = self.next_opstamp;
+        for document in documents {
+            add_operations.push(AddOperation {
+                opstamp,
+                document,
+                doc_id: None,
+            });
+            opstamp = opstamp.checked_add(1).ok_or_else(|| {
+                TantivyError::InvalidArgument("Document opstamp overflow".to_string())
+            })?;
+        }
+
+        self.write_batch(add_operations)?;
+        self.next_opstamp = next_opstamp;
+        Ok(())
+    }
+
     /// Adds a batch of documents with user-specified document IDs.
     ///
     /// Document IDs must be strictly increasing across and within batches. Sparse document IDs are
@@ -309,6 +362,162 @@ mod tests {
             .schema(schema_builder.build())
             .single_segment_index_writer(directory.clone(), MEMORY_BUDGET)?;
         Ok((text, directory, writer))
+    }
+
+    fn default_doc_id_writer() -> crate::Result<(
+        crate::schema::Field,
+        RamDirectory,
+        super::SingleSegmentIndexWriter<TantivyDocument>,
+    )> {
+        let mut schema_builder = Schema::builder();
+        let text = schema_builder.add_text_field("text", TEXT);
+        let directory = RamDirectory::default();
+        let writer = Index::builder()
+            .schema(schema_builder.build())
+            .single_segment_index_writer(directory.clone(), MEMORY_BUDGET)?;
+        Ok((text, directory, writer))
+    }
+
+    #[test]
+    fn test_add_documents_assigns_sequential_doc_ids_across_batches() -> crate::Result<()> {
+        let (text, directory, mut writer) = default_doc_id_writer()?;
+        let direct_segment_id = writer.segment.id();
+
+        writer.add_documents(Vec::<TantivyDocument>::new())?;
+        writer.add_documents(vec![doc!(text => "shared"), doc!(text => "other")])?;
+        writer.add_documents(vec![doc!(text => "shared")])?;
+        writer.finalize()?;
+
+        let index = Index::open(directory)?;
+        let segment_metas = index.searchable_segment_metas()?;
+        assert_eq!(segment_metas.len(), 1);
+        assert_eq!(segment_metas[0].id(), direct_segment_id);
+        assert_eq!(segment_metas[0].max_doc(), 3);
+
+        let searcher = index.reader()?.searcher();
+        let term_query = TermQuery::new(
+            Term::from_field_text(text, "shared"),
+            IndexRecordOption::Basic,
+        );
+        let mut doc_ids: Vec<u32> = searcher
+            .search(&term_query, &DocSetCollector)?
+            .into_iter()
+            .map(|doc_address| doc_address.doc_id)
+            .collect();
+        doc_ids.sort_unstable();
+        assert_eq!(doc_ids, [0, 2]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_documents_requires_default_doc_id_schema() -> crate::Result<()> {
+        let (text, _directory, mut writer) = user_doc_id_writer()?;
+
+        writer.add_documents(Vec::<TantivyDocument>::new())?;
+        let error = writer
+            .add_documents(vec![doc!(text => "invalid")])
+            .expect_err("non-empty batches must reject user-specified document ID schemas");
+        assert!(matches!(error, TantivyError::InvalidArgument(_)));
+
+        writer.add_documents_with_doc_ids(vec![(0, doc!(text => "valid"))])?;
+        writer.finalize()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_documents_rejects_max_doc_limit_atomically() -> crate::Result<()> {
+        let (text, _directory, mut writer) = default_doc_id_writer()?;
+        writer.next_opstamp = u64::from(MAX_DOC_LIMIT - 2);
+        let max_doc_before = writer
+            .segment_writer
+            .as_ref()
+            .expect("writer must be active")
+            .max_doc();
+
+        let error = writer
+            .add_documents(vec![doc!(text => "first"), doc!(text => "out of range")])
+            .expect_err("resulting max doc at MAX_DOC_LIMIT must be rejected");
+
+        assert!(matches!(error, TantivyError::InvalidArgument(_)));
+        assert_eq!(writer.next_opstamp, u64::from(MAX_DOC_LIMIT - 2));
+        assert_eq!(
+            writer
+                .segment_writer
+                .as_ref()
+                .expect("validation errors must not poison the writer")
+                .max_doc(),
+            max_doc_before
+        );
+
+        writer.next_opstamp = 0;
+        writer.add_documents(vec![doc!(text => "valid")])?;
+        writer.finalize()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_documents_rejects_opstamp_overflow_atomically() -> crate::Result<()> {
+        let (text, _directory, mut writer) = default_doc_id_writer()?;
+        writer.next_opstamp = u64::MAX;
+
+        let error = writer
+            .add_documents(vec![doc!(text => "overflow")])
+            .expect_err("opstamp overflow must be rejected");
+        assert!(matches!(error, TantivyError::InvalidArgument(_)));
+        assert_eq!(writer.next_opstamp, u64::MAX);
+        assert_eq!(
+            writer
+                .segment_writer
+                .as_ref()
+                .expect("validation errors must not poison the writer")
+                .max_doc(),
+            0
+        );
+
+        writer.next_opstamp = 0;
+        writer.add_documents(vec![doc!(text => "valid")])?;
+        writer.finalize()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_documents_error_drops_partial_segment_without_publishing_meta() -> crate::Result<()>
+    {
+        let mut schema_builder = Schema::builder();
+        let number =
+            schema_builder.add_u64_field("number", NumericOptions::default().set_indexed());
+        let directory = RamDirectory::default();
+        let mut writer = Index::builder()
+            .schema(schema_builder.build())
+            .single_segment_index_writer(directory.clone(), MEMORY_BUDGET)?;
+
+        let first_error = writer
+            .add_documents(vec![
+                doc!(number => 123u64),
+                doc!(number => "invalid after first write"),
+            ])
+            .expect_err("the schema error must be returned by the batch call");
+        assert!(matches!(first_error, TantivyError::SchemaError(_)));
+        assert!(writer.segment_writer.is_none());
+
+        let empty_batch_error = writer
+            .add_documents(Vec::<TantivyDocument>::new())
+            .expect_err("a poisoned writer must reject later empty batches");
+        assert_eq!(empty_batch_error.to_string(), first_error.to_string());
+
+        let finalize_error = match writer.finalize() {
+            Ok(_) => {
+                return Err(TantivyError::SystemError(
+                    "partially written segment unexpectedly finalized".to_string(),
+                ));
+            }
+            Err(error) => error,
+        };
+        assert_eq!(finalize_error.to_string(), first_error.to_string());
+
+        let index = Index::open(directory)?;
+        assert!(index.load_metas()?.segments.is_empty());
+        Ok(())
     }
 
     #[test]
