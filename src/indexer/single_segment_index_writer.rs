@@ -2,8 +2,6 @@ use std::any::Any;
 use std::marker::PhantomData;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use smallvec::smallvec;
-
 use super::AddBatch;
 use crate::indexer::merger::MAX_DOC_LIMIT;
 use crate::indexer::operation::AddOperation;
@@ -27,13 +25,58 @@ fn panic_to_error(context: &str, panic_payload: Box<dyn Any + Send>) -> TantivyE
     ))
 }
 
+/// Builds an index made of exactly one segment, without spawning any indexing thread.
+///
+/// Documents are indexed synchronously, on the calling thread: the `add_*` methods return
+/// once the documents have been handed over to the underlying `SegmentWriter`, and any
+/// failure is reported to the caller that submitted them.
+///
+/// # Document IDs
+///
+/// The schema decides which insertion methods are usable, and the two modes are mutually
+/// exclusive:
+/// - schemas without user specified document IDs: [`Self::add_document`] and
+///   [`Self::add_documents`], which assign sequential document IDs starting at `0`;
+/// - schemas built with `SchemaBuilder::enable_user_specified_doc_id`:
+///   [`Self::add_documents_with_doc_ids`] only.
+///
+/// Using the wrong method returns [`TantivyError::InvalidArgument`] instead of writing
+/// anything.
+///
+/// # Failure contract
+///
+/// Failures come in two flavours:
+/// - *validation* failures (wrong method for the schema, document ID out of range or out of order,
+///   opstamp overflow) are detected before anything is written. The batch is rejected as a whole
+///   and the writer remains usable.
+/// - *indexing* failures poison the writer permanently. Panics raised by a document or a tokenizer
+///   are caught and converted into [`TantivyError::ErrorInThread`], and are treated as indexing
+///   failures too. Every subsequent call, [`Self::finalize`] included, returns that first error,
+///   and the partially written segment is never published in `meta.json`. The files it already
+///   wrote are left behind: this writer runs no garbage collection, so the caller is expected to
+///   discard the whole directory.
 #[doc(hidden)]
 pub struct SingleSegmentIndexWriter<D: Document = TantivyDocument> {
     segment: Segment,
+    /// Settings as configured by the caller, captured before [`Self::new`] disabled the doc
+    /// store's dedicated compression thread. This is what gets published in `meta.json` and
+    /// restored on the `Index` returned by [`Self::finalize`].
     index_settings: IndexSettings,
+    /// Whether the schema requires the caller to supply document IDs.
+    ///
+    /// Cached at construction time: the schema cannot change over the lifetime of an index,
+    /// while reading it back from the index clones an `Arc` on every call.
+    user_specified_doc_id: bool,
+    /// `None` once the writer has been poisoned by an indexing failure, or once it has been
+    /// consumed by [`Self::finalize`].
     segment_writer: Option<SegmentWriter>,
+    /// The indexing failure that poisoned this writer, if any.
     first_error: Option<TantivyError>,
+    /// Opstamp that will be assigned to the next document. With sequential document IDs it
+    /// doubles as the next document ID, and hence as the segment's current max doc.
     next_opstamp: Opstamp,
+    /// Largest document ID accepted so far. Used to enforce strictly increasing user
+    /// specified document IDs across batches.
     last_doc_id: Option<u32>,
     _phantom: PhantomData<D>,
 }
@@ -41,12 +84,22 @@ pub struct SingleSegmentIndexWriter<D: Document = TantivyDocument> {
 impl<D: Document> SingleSegmentIndexWriter<D> {
     pub fn new(mut index: Index, mem_budget: usize) -> crate::Result<Self> {
         let index_settings = index.settings().clone();
+        // The doc store's dedicated compression thread only pays off when documents keep
+        // arriving from another thread. Here indexing runs synchronously on the caller's
+        // thread, so that thread would only add channel hand-offs per block plus a join at
+        // finalization. Disable it for the segment we are about to write.
+        //
+        // This is a write side knob exclusively: no read path looks at it, and the caller's
+        // original value is kept in `index_settings` so that neither `meta.json` nor the
+        // `Index` returned by `finalize` advertises a value we changed behind their back.
         index.settings_mut().docstore_compress_dedicated_thread = false;
+        let user_specified_doc_id = index.schema().user_specified_doc_id();
         let segment = index.new_segment();
         let segment_writer = SegmentWriter::for_segment(mem_budget, segment.clone())?;
         Ok(Self {
             segment,
             index_settings,
+            user_specified_doc_id,
             segment_writer: Some(segment_writer),
             first_error: None,
             next_opstamp: 0,
@@ -55,109 +108,95 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
         })
     }
 
+    /// Adds a single document, assigning it the next sequential document ID.
+    ///
+    /// Requires a schema without user specified document IDs. See the type level
+    /// documentation for the document ID and failure contracts.
     pub fn add_document(&mut self, document: D) -> crate::Result<()> {
-        self.ensure_active()?;
-        if self.segment.index().schema().user_specified_doc_id() {
-            return Err(TantivyError::InvalidArgument(
-                "add_document cannot be used when user specified document IDs are enabled"
-                    .to_string(),
-            ));
-        }
-        let next_opstamp = self.next_opstamp.checked_add(1).ok_or_else(|| {
-            TantivyError::InvalidArgument("Document opstamp overflow".to_string())
-        })?;
-        if next_opstamp >= Opstamp::from(MAX_DOC_LIMIT) {
-            return Err(TantivyError::InvalidArgument(format!(
-                "Document ID {} is out of range: resulting max doc must be less than {}",
-                self.next_opstamp, MAX_DOC_LIMIT
-            )));
-        }
-        let add_operation = AddOperation {
-            opstamp: self.next_opstamp,
-            document,
-            doc_id: None,
-        };
-        self.write_batch(smallvec![add_operation])?;
-        self.next_opstamp = next_opstamp;
-        Ok(())
+        self.add_documents(std::iter::once(document))
     }
 
-    /// Adds a batch of documents with sequential document IDs.
+    /// Adds a batch of documents, assigning them consecutive document IDs starting right
+    /// after the last document added so far.
+    ///
+    /// Requires a schema without user specified document IDs, and an iterator whose length
+    /// is known upfront, so that the resulting max doc can be validated before any document
+    /// is written. See the type level documentation for the failure contract.
     pub fn add_documents<I>(&mut self, documents: I) -> crate::Result<()>
     where
         I: IntoIterator<Item = D>,
         I::IntoIter: ExactSizeIterator,
     {
         self.ensure_active()?;
+        if self.user_specified_doc_id {
+            return Err(TantivyError::InvalidArgument(
+                "Sequential document IDs cannot be used when the schema enables user specified \
+                 document IDs: use add_documents_with_doc_ids"
+                    .to_string(),
+            ));
+        }
         let documents = documents.into_iter();
         if documents.len() == 0 {
             return Ok(());
         }
-        if self.segment.index().schema().user_specified_doc_id() {
-            return Err(TantivyError::InvalidArgument(
-                "add_documents cannot be used when user specified document IDs are enabled"
-                    .to_string(),
-            ));
-        }
 
-        let document_count = Opstamp::try_from(documents.len()).map_err(|_| {
-            TantivyError::InvalidArgument("Document batch length overflow".to_string())
-        })?;
-        let next_opstamp = self
-            .next_opstamp
-            .checked_add(document_count)
-            .ok_or_else(|| {
-                TantivyError::InvalidArgument("Document opstamp overflow".to_string())
-            })?;
-        if next_opstamp >= Opstamp::from(MAX_DOC_LIMIT) {
+        // With sequential document IDs the opstamp counter is also the document ID counter,
+        // so the opstamp reached at the end of the batch is the segment's resulting max doc.
+        let last_opstamp = self.checked_next_opstamp(documents.len())?;
+        if last_opstamp >= Opstamp::from(MAX_DOC_LIMIT) {
             return Err(TantivyError::InvalidArgument(format!(
-                "Document ID {} is out of range: resulting max doc must be less than {}",
-                next_opstamp - 1,
-                MAX_DOC_LIMIT
+                "Document ID {} is out of range: resulting max doc must be less than \
+                 {MAX_DOC_LIMIT}",
+                last_opstamp - 1,
             )));
         }
 
-        let mut add_operations = AddBatch::with_capacity(documents.len());
-        let mut opstamp = self.next_opstamp;
-        for document in documents {
-            add_operations.push(AddOperation {
-                opstamp,
+        let first_opstamp = self.next_opstamp;
+        let add_operations = documents
+            .enumerate()
+            .map(|(offset, document)| AddOperation {
+                opstamp: first_opstamp + offset as Opstamp,
                 document,
                 doc_id: None,
             });
-            opstamp = opstamp.checked_add(1).ok_or_else(|| {
-                TantivyError::InvalidArgument("Document opstamp overflow".to_string())
-            })?;
-        }
-
-        self.write_batch(add_operations)?;
-        self.next_opstamp = next_opstamp;
+        let num_docs = self.write_batch(add_operations)?;
+        // Derived from what was actually written rather than from the announced length, so
+        // that the opstamp counter cannot drift from the segment's document count.
+        self.next_opstamp = first_opstamp + num_docs as Opstamp;
         Ok(())
     }
 
     /// Adds a batch of documents with user-specified document IDs.
     ///
-    /// Document IDs must be strictly increasing across and within batches. Sparse document IDs are
-    /// allowed.
+    /// Requires a schema with user specified document IDs. Document IDs must be strictly
+    /// increasing across and within batches. Sparse document IDs are allowed, and leave the
+    /// skipped document IDs empty in the resulting segment. See the type level documentation
+    /// for the failure contract.
     pub fn add_documents_with_doc_ids<I>(&mut self, documents: I) -> crate::Result<()>
     where
         I: IntoIterator<Item = (u32, D)>,
         I::IntoIter: ExactSizeIterator,
     {
         self.ensure_active()?;
+        if !self.user_specified_doc_id {
+            return Err(TantivyError::InvalidArgument(
+                "User specified document IDs are not enabled on this schema: use add_documents"
+                    .to_string(),
+            ));
+        }
         let documents = documents.into_iter();
         if documents.len() == 0 {
             return Ok(());
         }
-        if !self.segment.index().schema().user_specified_doc_id() {
-            return Err(TantivyError::InvalidArgument(
-                "User specified id is not enabled".to_string(),
-            ));
-        }
+        self.checked_next_opstamp(documents.len())?;
 
+        // Unlike sequential document IDs, user specified ones can only be validated against
+        // their predecessor, which is unknown before walking the batch. Materialize the
+        // operations first so that an invalid document ID rejects the batch as a whole
+        // instead of leaving the documents preceding it indexed.
         let mut add_operations = AddBatch::with_capacity(documents.len());
         let mut previous_doc_id = self.last_doc_id;
-        let mut next_opstamp = self.next_opstamp;
+        let mut opstamp = self.next_opstamp;
         for (doc_id, document) in documents {
             match doc_id.checked_add(1) {
                 Some(max_doc) if max_doc < MAX_DOC_LIMIT => {}
@@ -171,27 +210,34 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
             if let Some(previous_doc_id) = previous_doc_id {
                 if doc_id <= previous_doc_id {
                     return Err(TantivyError::InvalidArgument(format!(
-                        "Document ID must be strictly ordered: previous doc id {}, current doc id \
-                         {}",
-                        previous_doc_id, doc_id,
+                        "Document ID must be strictly ordered: previous doc id {previous_doc_id}, \
+                         current doc id {doc_id}"
                     )));
                 }
             }
             add_operations.push(AddOperation {
-                opstamp: next_opstamp,
+                opstamp,
                 document,
                 doc_id: Some(doc_id),
             });
             previous_doc_id = Some(doc_id);
-            next_opstamp = next_opstamp.checked_add(1).ok_or_else(|| {
-                TantivyError::InvalidArgument("Document opstamp overflow".to_string())
-            })?;
+            opstamp += 1;
         }
 
-        self.write_batch(add_operations)?;
+        let first_opstamp = self.next_opstamp;
+        let num_docs = self.write_batch(add_operations.into_iter())?;
         self.last_doc_id = previous_doc_id;
-        self.next_opstamp = next_opstamp;
+        self.next_opstamp = first_opstamp + num_docs as Opstamp;
         Ok(())
+    }
+
+    /// Opstamp the counter would reach after appending `num_docs` documents, or an error if
+    /// that would overflow.
+    fn checked_next_opstamp(&self, num_docs: usize) -> crate::Result<Opstamp> {
+        Opstamp::try_from(num_docs)
+            .ok()
+            .and_then(|num_docs| self.next_opstamp.checked_add(num_docs))
+            .ok_or_else(|| TantivyError::InvalidArgument("Document opstamp overflow".to_string()))
     }
 
     fn ensure_active(&self) -> crate::Result<()> {
@@ -211,24 +257,31 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
         self.first_error.get_or_insert(error).clone()
     }
 
-    fn write_batch(&mut self, add_operations: AddBatch<D>) -> crate::Result<()> {
+    /// Indexes `add_operations` and returns how many of them were written.
+    ///
+    /// Any failure, panics included, poisons the writer and drops the segment writer along
+    /// with the partially written segment.
+    fn write_batch<I>(&mut self, add_operations: I) -> crate::Result<usize>
+    where I: Iterator<Item = AddOperation<D>> {
         self.ensure_active()?;
         let mut segment_writer = self.segment_writer.take().ok_or_else(|| {
             TantivyError::InternalError("Single segment writer is unavailable".to_string())
         })?;
         let write_result = catch_unwind(AssertUnwindSafe(|| {
             futures_executor::block_on(async {
+                let mut num_docs = 0usize;
                 for add_operation in add_operations {
                     segment_writer.add_document(add_operation).await?;
+                    num_docs += 1;
                 }
-                Ok(())
+                Ok::<usize, TantivyError>(num_docs)
             })
         }));
 
         match write_result {
-            Ok(Ok(())) => {
+            Ok(Ok(num_docs)) => {
                 self.segment_writer = Some(segment_writer);
-                Ok(())
+                Ok(num_docs)
             }
             Ok(Err(error)) => {
                 drop(segment_writer);
@@ -243,6 +296,10 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
         }
     }
 
+    /// Serializes the segment, publishes it in `meta.json` and returns the resulting index.
+    ///
+    /// Returns the first indexing error instead if the writer has been poisoned; in that case
+    /// `meta.json` is left without any segment.
     pub fn finalize(mut self) -> crate::Result<Index> {
         if let Some(error) = self.first_error {
             return Err(error);
@@ -251,6 +308,15 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
             TantivyError::InternalError("Single segment writer is unavailable".to_string())
         })?;
         let max_doc = segment_writer.max_doc();
+        // Backstop for the per-batch validation: whichever path produced the documents, a
+        // segment reaching `MAX_DOC_LIMIT` cannot be merged, so refuse to publish it here
+        // rather than emitting an index that only blows up much later.
+        if max_doc >= MAX_DOC_LIMIT {
+            return Err(TantivyError::InvalidArgument(format!(
+                "Segment max doc {max_doc} is out of range: max doc must be less than \
+                 {MAX_DOC_LIMIT}"
+            )));
+        }
         match catch_unwind(AssertUnwindSafe(|| {
             futures_executor::block_on(segment_writer.finalize())
         })) {
@@ -337,6 +403,26 @@ mod tests {
         }
     }
 
+    /// An `ExactSizeIterator` announcing a length it does not honor.
+    struct MisreportedLen<I> {
+        inner: I,
+        claimed_len: usize,
+    }
+
+    impl<I: Iterator> Iterator for MisreportedLen<I> {
+        type Item = I::Item;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.inner.next()
+        }
+
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            (self.claimed_len, Some(self.claimed_len))
+        }
+    }
+
+    impl<I: Iterator> ExactSizeIterator for MisreportedLen<I> {}
+
     fn schema_error_writer() -> crate::Result<(
         crate::schema::Field,
         super::SingleSegmentIndexWriter<TantivyDocument>,
@@ -410,10 +496,39 @@ mod tests {
     }
 
     #[test]
+    fn test_add_documents_counts_the_documents_actually_written() -> crate::Result<()> {
+        let (text, directory, mut writer) = default_doc_id_writer()?;
+
+        // No standard iterator lies about its length, but a caller side adapter forwarding
+        // the wrong `size_hint` does. Such a batch must not punch a hole in the document ID
+        // sequence: the counter follows what was written, not what was announced.
+        writer.add_documents(MisreportedLen {
+            inner: vec![doc!(text => "first")].into_iter(),
+            claimed_len: 5,
+        })?;
+        assert_eq!(writer.next_opstamp, 1);
+
+        writer.add_documents(vec![doc!(text => "second")])?;
+        writer.finalize()?;
+
+        let index = Index::open(directory)?;
+        let segment_metas = index.searchable_segment_metas()?;
+        assert_eq!(segment_metas.len(), 1);
+        assert_eq!(segment_metas[0].max_doc(), 2);
+        Ok(())
+    }
+
+    #[test]
     fn test_add_documents_requires_default_doc_id_schema() -> crate::Result<()> {
         let (text, _directory, mut writer) = user_doc_id_writer()?;
 
-        writer.add_documents(Vec::<TantivyDocument>::new())?;
+        let empty_batch_error = writer
+            .add_documents(Vec::<TantivyDocument>::new())
+            .expect_err("empty batches must reject user-specified document ID schemas too");
+        assert!(matches!(
+            empty_batch_error,
+            TantivyError::InvalidArgument(_)
+        ));
         let error = writer
             .add_documents(vec![doc!(text => "invalid")])
             .expect_err("non-empty batches must reject user-specified document ID schemas");
@@ -607,6 +722,13 @@ mod tests {
             .schema(schema_builder.build())
             .single_segment_index_writer(directory, MEMORY_BUDGET)?;
 
+        let empty_batch_error = writer
+            .add_documents_with_doc_ids(Vec::<(u32, TantivyDocument)>::new())
+            .expect_err("empty batches must reject default document ID schemas too");
+        assert!(matches!(
+            empty_batch_error,
+            TantivyError::InvalidArgument(_)
+        ));
         let error = writer
             .add_documents_with_doc_ids(vec![(0, doc!(text => "invalid"))])
             .unwrap_err();
