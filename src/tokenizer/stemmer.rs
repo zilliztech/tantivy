@@ -11,6 +11,7 @@ use super::{Token, TokenFilter, TokenStream, Tokenizer};
 #[allow(missing_docs)]
 pub enum Language {
     Arabic,
+    Czech,
     Danish,
     Dutch,
     English,
@@ -35,6 +36,7 @@ impl Language {
         use self::Language::*;
         match self {
             Arabic => Algorithm::Arabic,
+            Czech => Algorithm::Czech,
             Danish => Algorithm::Danish,
             Dutch => Algorithm::Dutch,
             English => Algorithm::English,
@@ -140,5 +142,37 @@ impl<T: TokenStream> TokenStream for StemmerTokenStream<T> {
 
     fn token_mut(&mut self) -> &mut Token {
         self.tail.token_mut()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Language, Stemmer};
+    use crate::tokenizer::{SimpleTokenizer, TextAnalyzer};
+
+    fn stem_word(language: Language, text: &str) -> String {
+        let mut analyzer = TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(Stemmer::new(language))
+            .build();
+        let mut stream = analyzer.token_stream(text);
+        assert!(stream.advance());
+        let text = stream.token().text.clone();
+        assert!(!stream.advance());
+        text
+    }
+
+    #[test]
+    fn test_czech_stemmer() {
+        assert_eq!(stem_word(Language::Czech, "abdikovat"), "abdik");
+        assert_eq!(stem_word(Language::Czech, "abeceda"), "abeced");
+        assert_eq!(stem_word(Language::Czech, "abatyše"), "abatyš");
+    }
+
+    #[test]
+    fn test_czech_language_algorithm_mapping() {
+        assert_eq!(
+            Language::Czech.algorithm(),
+            rust_stemmers::Algorithm::Czech
+        );
     }
 }
