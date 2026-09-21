@@ -241,6 +241,7 @@ fn intersection_count_with_slop_with_spans(
     max_slop: u32,
     spans_buffer: &mut Vec<PositionSpan>,
 ) -> u32 {
+    debug_assert!(spans_buffer.is_empty());
     // Fast path for a single span and a single next position. Must stay consistent with the
     // general loop below: expand the span toward `position`, keep it only if width <= max_slop.
     if let ([span], [position]) = (current_spans.as_mut_slice(), next_positions) {
