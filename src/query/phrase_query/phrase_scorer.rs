@@ -241,6 +241,8 @@ fn intersection_count_with_slop_with_spans(
     max_slop: u32,
     spans_buffer: &mut Vec<PositionSpan>,
 ) -> u32 {
+    // Fast path for a single span and a single next position. Must stay consistent with the
+    // general loop below: expand the span toward `position`, keep it only if width <= max_slop.
     if let ([span], [position]) = (current_spans.as_mut_slice(), next_positions) {
         if *position < span.left {
             span.left = *position;
@@ -400,6 +402,8 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
                 PostingsWithOffset::new(postings, (max_offset - offset) as u32)
             })
             .collect::<Vec<_>>();
+        // Must match `has_slop() && num_terms > 2` in `compute_phrase_match`.
+        let needs_span_buffers = slop > 0 && num_docsets > 2;
         let mut scorer = PhraseScorer {
             intersection_docset: Intersection::new(postings_with_offsets),
             num_terms: num_docsets,
@@ -409,12 +413,12 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
             similarity_weight_opt,
             fieldnorm_reader,
             slop,
-            current_spans: if slop > 0 && num_docsets > 2 {
+            current_spans: if needs_span_buffers {
                 Vec::with_capacity(100)
             } else {
                 Vec::new()
             },
-            spans_buffer: if slop > 0 && num_docsets > 2 {
+            spans_buffer: if needs_span_buffers {
                 Vec::with_capacity(100)
             } else {
                 Vec::new()
