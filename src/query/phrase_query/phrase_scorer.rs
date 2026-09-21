@@ -16,10 +16,6 @@ struct PositionSpan {
 }
 
 impl PositionSpan {
-    fn distance(&self) -> u32 {
-        self.right - self.left
-    }
-
     fn non_overlap(&self, other: &PositionSpan) -> bool {
         self.right < other.left || self.left > other.right
     }
@@ -208,6 +204,28 @@ fn intersection_count_with_slop(
     count
 }
 
+fn intersection_exists_with_slop(
+    left_positions: &[u32],
+    right_positions: &[u32],
+    slop: u32,
+) -> bool {
+    let mut left_index = 0;
+    let mut right_index = 0;
+    while left_index < left_positions.len() && right_index < right_positions.len() {
+        let left_val = left_positions[left_index];
+        let right_val = right_positions[right_index];
+        if left_val.abs_diff(right_val) <= slop {
+            return true;
+        }
+        if left_val < right_val {
+            left_index += 1;
+        } else {
+            right_index += 1;
+        }
+    }
+    false
+}
+
 /// Identifies matching spans within a positional slop constraint and builds expanded position
 /// spans.
 ///
@@ -223,6 +241,19 @@ fn intersection_count_with_slop_with_spans(
     max_slop: u32,
     spans_buffer: &mut Vec<PositionSpan>,
 ) -> u32 {
+    if let ([span], [position]) = (current_spans.as_mut_slice(), next_positions) {
+        if *position < span.left {
+            span.left = *position;
+        } else if *position > span.right {
+            span.right = *position;
+        }
+        if span.right - span.left <= max_slop {
+            return 1;
+        }
+        current_spans.clear();
+        return 0;
+    }
+
     let mut count = 0;
     // keep the index to start the next iteration
     // prune elemtents that cannot be a best match
@@ -232,7 +263,6 @@ fn intersection_count_with_slop_with_spans(
     for prev_qualified in current_spans.iter() {
         let mut best_match = SmallVec::<[PositionSpan; 4]>::new();
         let mut best_match_distance = u32::MAX;
-        let mut record_no_expansion = false;
         for idx in start_index..next_positions.len() {
             let pos = next_positions[idx];
             if pos < prev_qualified.left {
@@ -279,12 +309,9 @@ fn intersection_count_with_slop_with_spans(
                 if pos == prev_qualified.left {
                     start_index = idx;
                 }
-                best_match_distance = prev_qualified.distance();
-                if !record_no_expansion {
-                    best_match.clear();
-                    best_match.push(*prev_qualified);
-                    record_no_expansion = true;
-                }
+                best_match.clear();
+                best_match.push(*prev_qualified);
+                break;
             }
         }
         if !best_match.is_empty() {
@@ -382,8 +409,16 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
             similarity_weight_opt,
             fieldnorm_reader,
             slop,
-            current_spans: Vec::with_capacity(100),
-            spans_buffer: Vec::with_capacity(100),
+            current_spans: if slop > 0 && num_docsets > 2 {
+                Vec::with_capacity(100)
+            } else {
+                Vec::new()
+            },
+            spans_buffer: if slop > 0 && num_docsets > 2 {
+                Vec::with_capacity(100)
+            } else {
+                Vec::new()
+            },
         };
         if scorer.doc() != TERMINATED && !scorer.phrase_match() {
             scorer.advance();
@@ -413,11 +448,19 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
     fn phrase_exists(&mut self) -> bool {
         self.compute_phrase_match();
         if self.has_slop() {
-            intersection_exists_with_slop_with_spans(
-                &self.current_spans,
-                &self.right_positions[..],
-                self.slop,
-            )
+            if self.num_terms > 2 {
+                intersection_exists_with_slop_with_spans(
+                    &self.current_spans,
+                    &self.right_positions[..],
+                    self.slop,
+                )
+            } else {
+                intersection_exists_with_slop(
+                    &self.left_positions,
+                    &self.right_positions,
+                    self.slop,
+                )
+            }
         } else {
             intersection_exists(&self.left_positions, &self.right_positions[..])
         }
@@ -451,7 +494,7 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
             .docset_mut_specialized(0)
             .positions(&mut self.left_positions);
 
-        if self.has_slop() {
+        if self.has_slop() && self.num_terms > 2 {
             // If having slop, we should keep the position span info to consider all possible
             // situations
             self.current_spans.clear();
@@ -476,7 +519,7 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
                     return;
                 }
             }
-        } else {
+        } else if !self.has_slop() {
             for i in 1..self.num_terms - 1 {
                 self.intersection_docset
                     .docset_mut_specialized(i)
@@ -570,6 +613,17 @@ mod tests {
         test_intersection_sym(&[5, 7], &[1, 5, 10, 12], &[5]);
         test_intersection_sym(&[1, 5, 6, 9, 10, 12], &[6, 8, 9, 12], &[6, 9, 12]);
     }
+
+    #[test]
+    fn test_intersection_exists_with_slop() {
+        assert!(!intersection_exists_with_slop(&[], &[1], 2));
+        assert!(!intersection_exists_with_slop(&[1], &[], 2));
+        assert!(!intersection_exists_with_slop(&[1], &[4], 2));
+        assert!(intersection_exists_with_slop(&[1], &[3], 2));
+        assert!(intersection_exists_with_slop(&[3], &[1], 2));
+        assert!(intersection_exists_with_slop(&[1, 1, 5], &[3, 3], 2));
+    }
+
     #[test]
     fn test_slop() {
         // The slop is not symmetric. It does not allow for the phrase to be out of order.
