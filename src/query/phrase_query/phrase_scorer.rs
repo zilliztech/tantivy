@@ -337,6 +337,157 @@ fn intersection_count_with_slop_with_spans(
     count
 }
 
+// For boolean existence, a contained span dominates its container: expanding both with any future
+// position preserves containment and never gives the smaller span a larger width.
+fn push_span_frontier(frontier: &mut Vec<PositionSpan>, candidate: PositionSpan) {
+    if let Some(last) = frontier.last() {
+        debug_assert!(last.left <= candidate.left);
+        if last.left == candidate.left && last.right <= candidate.right {
+            return;
+        }
+    }
+    // Candidate left endpoints are non-decreasing. Existing spans that contain this candidate
+    // therefore form a suffix of the frontier.
+    while frontier
+        .last()
+        .is_some_and(|last| last.right >= candidate.right)
+    {
+        frontier.pop();
+    }
+    debug_assert!(frontier.last().map_or(true, |last| {
+        last.left < candidate.left && last.right < candidate.right
+    }));
+    frontier.push(candidate);
+}
+
+/// Merges the minimal span frontier with one sorted position list.
+///
+/// For each span, only an in-span position or the nearest position on either side can produce a
+/// non-dominated result. Candidates are emitted with non-decreasing left endpoints, so intervals
+/// dominated by a new candidate form a suffix of `spans_buffer` and can be removed from the top.
+#[inline(always)]
+fn merge_span_frontier(
+    current_spans: &mut Vec<PositionSpan>,
+    next_positions: &[u32],
+    max_slop: u32,
+    spans_buffer: &mut Vec<PositionSpan>,
+) {
+    debug_assert!(spans_buffer.is_empty());
+    // Initial spans may repeat when a tokenizer emits the same term at one position. The merge
+    // removes those duplicates and restores the strict frontier invariant for subsequent terms.
+    debug_assert!(current_spans.windows(2).all(|spans| {
+        spans[0] == spans[1] || (spans[0].left < spans[1].left && spans[0].right < spans[1].right)
+    }));
+    // A single pair can update the frontier in place without searching or using the buffer.
+    if let ([span], [position]) = (current_spans.as_mut_slice(), next_positions) {
+        if *position < span.left {
+            span.left = *position;
+        } else if *position > span.right {
+            span.right = *position;
+        }
+        if span.right - span.left > max_slop {
+            current_spans.clear();
+        }
+        return;
+    }
+
+    // Keep the larger merge algorithms behind one call so the single-pair path stays small.
+    merge_span_frontier_slow(current_spans, next_positions, max_slop, spans_buffer);
+}
+
+#[inline(never)]
+fn merge_span_frontier_slow(
+    current_spans: &mut Vec<PositionSpan>,
+    next_positions: &[u32],
+    max_slop: u32,
+    spans_buffer: &mut Vec<PositionSpan>,
+) {
+    if let [span] = current_spans.as_slice() {
+        merge_single_span_frontier(*span, current_spans, next_positions, max_slop);
+        return;
+    }
+    let mut position_index = 0;
+    let mut last_predecessor_index = None;
+    for &span in current_spans.iter() {
+        while position_index < next_positions.len() && next_positions[position_index] < span.left {
+            position_index += 1;
+        }
+
+        if next_positions
+            .get(position_index)
+            .is_some_and(|&position| position <= span.right)
+        {
+            push_span_frontier(spans_buffer, span);
+            continue;
+        }
+
+        if let Some(predecessor_index) = position_index.checked_sub(1) {
+            if last_predecessor_index != Some(predecessor_index) {
+                // Later spans with the same predecessor have a larger right endpoint, so the first
+                // left expansion is contained in and dominates all of them.
+                last_predecessor_index = Some(predecessor_index);
+                let candidate = PositionSpan {
+                    left: next_positions[predecessor_index],
+                    right: span.right,
+                };
+                if candidate.right - candidate.left <= max_slop {
+                    push_span_frontier(spans_buffer, candidate);
+                }
+            }
+        }
+
+        if let Some(&successor) = next_positions.get(position_index) {
+            let candidate = PositionSpan {
+                left: span.left,
+                right: successor,
+            };
+            if candidate.right - candidate.left <= max_slop {
+                push_span_frontier(spans_buffer, candidate);
+            }
+        }
+    }
+
+    std::mem::swap(current_spans, spans_buffer);
+    spans_buffer.clear();
+}
+
+#[inline(always)]
+fn merge_single_span_frontier(
+    span: PositionSpan,
+    current_spans: &mut Vec<PositionSpan>,
+    next_positions: &[u32],
+    max_slop: u32,
+) {
+    // A single span only needs the nearest position on either side.
+    let position_index = next_positions.partition_point(|&position| position < span.left);
+    if next_positions
+        .get(position_index)
+        .is_some_and(|&position| position <= span.right)
+    {
+        return;
+    }
+
+    current_spans.clear();
+    if let Some(predecessor_index) = position_index.checked_sub(1) {
+        let candidate = PositionSpan {
+            left: next_positions[predecessor_index],
+            right: span.right,
+        };
+        if candidate.right - candidate.left <= max_slop {
+            current_spans.push(candidate);
+        }
+    }
+    if let Some(&successor) = next_positions.get(position_index) {
+        let candidate = PositionSpan {
+            left: span.left,
+            right: successor,
+        };
+        if candidate.right - candidate.left <= max_slop {
+            current_spans.push(candidate);
+        }
+    }
+}
+
 fn intersection_exists_with_slop_with_spans(
     current_spans: &[PositionSpan],
     next_positions: &[u32],
@@ -403,7 +554,7 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
                 PostingsWithOffset::new(postings, (max_offset - offset) as u32)
             })
             .collect::<Vec<_>>();
-        // Must match `has_slop() && num_terms > 2` in `compute_phrase_match`.
+        // Must match the multi-term slop branches in `phrase_exists` and `compute_phrase_match`.
         let needs_span_buffers = slop > 0 && num_docsets > 2;
         let mut scorer = PhraseScorer {
             intersection_docset: Intersection::new(postings_with_offsets),
@@ -451,24 +602,68 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
     }
 
     fn phrase_exists(&mut self) -> bool {
-        self.compute_phrase_match();
-        if self.has_slop() {
-            if self.num_terms > 2 {
-                intersection_exists_with_slop_with_spans(
-                    &self.current_spans,
-                    &self.right_positions[..],
-                    self.slop,
-                )
-            } else {
+        // Keep the common two-term path independent of the multi-term span setup.
+        if self.num_terms == 2 {
+            self.intersection_docset
+                .docset_mut_specialized(0)
+                .positions(&mut self.left_positions);
+            self.intersection_docset
+                .docset_mut_specialized(1)
+                .positions(&mut self.right_positions);
+            return if self.has_slop() {
                 intersection_exists_with_slop(
                     &self.left_positions,
                     &self.right_positions,
                     self.slop,
                 )
-            }
-        } else {
-            intersection_exists(&self.left_positions, &self.right_positions[..])
+            } else {
+                intersection_exists(&self.left_positions, &self.right_positions)
+            };
         }
+        if self.has_slop() {
+            return self.phrase_exists_with_slop();
+        }
+        self.compute_phrase_match();
+        intersection_exists(&self.left_positions, &self.right_positions)
+    }
+
+    // Keep the multi-term setup out of the common two-term phrase-match path.
+    #[inline(never)]
+    fn phrase_exists_with_slop(&mut self) -> bool {
+        self.intersection_docset
+            .docset_mut_specialized(0)
+            .positions(&mut self.left_positions);
+        self.current_spans.clear();
+        self.current_spans.reserve(self.left_positions.len());
+        self.current_spans
+            .extend(self.left_positions.iter().map(|&position| PositionSpan {
+                left: position,
+                right: position,
+            }));
+
+        for i in 1..self.num_terms - 1 {
+            self.intersection_docset
+                .docset_mut_specialized(i)
+                .positions(&mut self.right_positions);
+            merge_span_frontier(
+                &mut self.current_spans,
+                &self.right_positions,
+                self.slop,
+                &mut self.spans_buffer,
+            );
+            if self.current_spans.is_empty() {
+                return false;
+            }
+        }
+
+        self.intersection_docset
+            .docset_mut_specialized(self.num_terms - 1)
+            .positions(&mut self.right_positions);
+        intersection_exists_with_slop_with_spans(
+            &self.current_spans,
+            &self.right_positions,
+            self.slop,
+        )
     }
 
     fn compute_phrase_count(&mut self) -> u32 {
@@ -589,6 +784,8 @@ impl<TPostings: Postings> Scorer for PhraseScorer<TPostings> {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     fn test_intersection_sym(left: &[u32], right: &[u32], expected: &[u32]) {
@@ -627,6 +824,137 @@ mod tests {
         assert!(intersection_exists_with_slop(&[1], &[3], 2));
         assert!(intersection_exists_with_slop(&[3], &[1], 2));
         assert!(intersection_exists_with_slop(&[1, 1, 5], &[3, 3], 2));
+    }
+
+    #[test]
+    fn test_span_frontier_retains_non_dominated_expansions() {
+        let mut spans = vec![PositionSpan {
+            left: 10,
+            right: 10,
+        }];
+        let mut buffer = Vec::new();
+        merge_span_frontier(&mut spans, &[15], 90, &mut buffer);
+        merge_span_frontier(&mut spans, &[9, 100], 90, &mut buffer);
+
+        assert_eq!(
+            spans,
+            [
+                PositionSpan { left: 9, right: 15 },
+                PositionSpan {
+                    left: 10,
+                    right: 100,
+                },
+            ]
+        );
+        assert!(intersection_exists_with_slop_with_spans(&spans, &[100], 90));
+    }
+
+    fn span_frontier_exists(position_lists: &[&[u32]], max_slop: u32) -> bool {
+        let mut spans = position_lists[0]
+            .iter()
+            .map(|&position| PositionSpan {
+                left: position,
+                right: position,
+            })
+            .collect::<Vec<_>>();
+        let mut buffer = Vec::new();
+        for positions in &position_lists[1..position_lists.len() - 1] {
+            merge_span_frontier(&mut spans, positions, max_slop, &mut buffer);
+            assert!(spans
+                .windows(2)
+                .all(|pair| { pair[0].left < pair[1].left && pair[0].right < pair[1].right }));
+        }
+        intersection_exists_with_slop_with_spans(
+            &spans,
+            position_lists[position_lists.len() - 1],
+            max_slop,
+        )
+    }
+
+    fn brute_force_phrase_exists(position_lists: &[&[u32]], max_slop: u32) -> bool {
+        fn visit(
+            position_lists: &[&[u32]],
+            term_index: usize,
+            left: u32,
+            right: u32,
+            max_slop: u32,
+        ) -> bool {
+            if term_index == position_lists.len() {
+                return true;
+            }
+            position_lists[term_index].iter().any(|&position| {
+                let left = left.min(position);
+                let right = right.max(position);
+                right - left <= max_slop
+                    && visit(position_lists, term_index + 1, left, right, max_slop)
+            })
+        }
+
+        position_lists[0]
+            .iter()
+            .any(|&position| visit(position_lists, 1, position, position, max_slop))
+    }
+
+    #[test]
+    fn test_span_frontier_matches_brute_force() {
+        let position_sets = (1u32..1 << 4)
+            .map(|mask| {
+                (0..4)
+                    .filter(|position| mask & (1 << position) != 0)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        for first in &position_sets {
+            for second in &position_sets {
+                for third in &position_sets {
+                    for fourth in &position_sets {
+                        let positions = [
+                            first.as_slice(),
+                            second.as_slice(),
+                            third.as_slice(),
+                            fourth.as_slice(),
+                        ];
+                        for max_slop in 0..=3 {
+                            assert_eq!(
+                                span_frontier_exists(&positions, max_slop),
+                                brute_force_phrase_exists(&positions, max_slop),
+                                "positions={positions:?}, max_slop={max_slop}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1_000))]
+        #[test]
+        fn test_span_frontier_matches_random_brute_force(
+            position_sets in proptest::collection::vec(
+                proptest::collection::btree_set(0u32..128, 1..6),
+                3..11,
+            ),
+            max_slop in 0u32..128,
+        ) {
+            let position_lists = position_sets
+                .iter()
+                .map(|positions| positions.iter().copied().collect::<Vec<_>>())
+                .collect::<Vec<_>>();
+            let positions = position_lists
+                .iter()
+                .map(Vec::as_slice)
+                .collect::<Vec<_>>();
+
+            prop_assert_eq!(
+                span_frontier_exists(&positions, max_slop),
+                brute_force_phrase_exists(&positions, max_slop),
+                "positions={:?}, max_slop={}",
+                positions,
+                max_slop,
+            );
+        }
     }
 
     #[test]
