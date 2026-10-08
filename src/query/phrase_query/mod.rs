@@ -126,6 +126,68 @@ pub(crate) mod tests {
     }
 
     #[test]
+    pub fn test_phrase_query_no_score_retains_non_dominated_spans() -> crate::Result<()> {
+        let mut tokens = vec!["x"; 101];
+        tokens[7] = "a";
+        tokens[8] = "c";
+        tokens[13] = "b";
+        tokens[99] = "c";
+        tokens[100] = "d";
+        let index = create_index(&[tokens.join(" ")])?;
+        let text_field = index.schema().get_field("text").unwrap();
+        let searcher = index.reader()?.searcher();
+        let terms = ["a", "b", "c", "d"]
+            .iter()
+            .map(|text| Term::from_field_text(text_field, text))
+            .collect();
+        let mut phrase_query = PhraseQuery::new(terms);
+        phrase_query.set_slop(90);
+
+        let match_count = searcher.search(&phrase_query, &crate::collector::Count)?;
+        assert_eq!(match_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_phrase_query_no_score_with_duplicate_positions() -> crate::Result<()> {
+        use crate::schema::{IndexRecordOption, TextFieldIndexing, TextOptions};
+        use crate::tokenizer::{SimpleTokenizer, SplitCompoundWords, TextAnalyzer};
+
+        let text_options = TextOptions::default().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("split_compound")
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+        );
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", text_options);
+        let index = Index::create_in_ram(schema_builder.build());
+        let split_compound = SplitCompoundWords::from_dictionary(["foo"])?;
+        let tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(split_compound)
+            .build();
+        index.tokenizers().register("split_compound", tokenizer);
+        let mut index_writer = index.writer_for_tests()?;
+        index_writer.add_document(doc!(text_field=>"foofoo b c"))?;
+        index_writer.commit()?;
+
+        let terms = ["foo", "b", "c"]
+            .iter()
+            .map(|text| Term::from_field_text(text_field, text))
+            .collect();
+        let mut phrase_query = PhraseQuery::new(terms);
+        phrase_query.set_slop(1);
+
+        assert_eq!(
+            index
+                .reader()?
+                .searcher()
+                .search(&phrase_query, &crate::collector::Count)?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
     pub fn test_phrase_query_no_positions() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         use crate::schema::{IndexRecordOption, TextFieldIndexing, TextOptions};
