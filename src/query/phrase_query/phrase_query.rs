@@ -1,4 +1,7 @@
-use super::PhraseWeight;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use super::{PhraseWeight, RepeatedPhraseWeight};
 use crate::query::bm25::Bm25Weight;
 use crate::query::{EnableScoring, Query, Weight};
 use crate::schema::{Field, IndexRecordOption, Term};
@@ -24,6 +27,8 @@ pub struct PhraseQuery {
     field: Field,
     phrase_terms: Vec<(usize, Term)>,
     slop: u32,
+    // Query terms are immutable; clones and segment weights can share their occurrence IDs.
+    repeated_term_ids: Option<Arc<[usize]>>,
 }
 
 impl PhraseQuery {
@@ -56,10 +61,20 @@ impl PhraseQuery {
             terms[1..].iter().all(|term| term.1.field() == field),
             "All terms from a phrase query must belong to the same field"
         );
+        let repeated_term_ids = {
+            let mut term_ids = HashMap::new();
+            let occurrence_ids = terms
+                .iter()
+                .enumerate()
+                .map(|(index, (_, term))| *term_ids.entry(term).or_insert(index))
+                .collect::<Vec<_>>();
+            (term_ids.len() < terms.len()).then(|| Arc::from(occurrence_ids))
+        };
         PhraseQuery {
             field,
             phrase_terms: terms,
             slop,
+            repeated_term_ids,
         }
     }
 
@@ -137,6 +152,17 @@ impl Query for PhraseQuery {
     ///
     /// See [`Weight`].
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
+        if let (EnableScoring::Disabled { .. }, Some(term_ids)) =
+            (&enable_scoring, &self.repeated_term_ids)
+        {
+            // Reuse `phrase_weight` for the schema validation shared by all phrase queries.
+            self.phrase_weight(enable_scoring)?;
+            return Ok(Box::new(RepeatedPhraseWeight::new(
+                self.phrase_terms.clone(),
+                Arc::clone(term_ids),
+                self.slop,
+            )));
+        }
         let phrase_weight = self.phrase_weight(enable_scoring)?;
         Ok(Box::new(phrase_weight))
     }
@@ -150,12 +176,35 @@ impl Query for PhraseQuery {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use itertools::Itertools;
 
     use super::PhraseQuery;
     use crate::collector::DocSetCollector;
     use crate::schema::{Schema, TEXT_WITH_DOC_ID};
     use crate::{Index, Term};
+
+    #[test]
+    fn test_repeated_term_ids_are_shared_by_query_clones() {
+        let mut builder = Schema::builder();
+        let field = builder.add_text_field("text", TEXT_WITH_DOC_ID);
+        let term = |text| Term::from_field_text(field, text);
+        let query = PhraseQuery::new_with_offset(vec![
+            (4, term("a")),
+            (0, term("b")),
+            (2, term("a")),
+            (5, term("b")),
+        ]);
+        let mut cloned = query.clone();
+        cloned.set_slop(3);
+        let ids = query.repeated_term_ids.as_ref().unwrap();
+        assert_eq!(&**ids, &[0, 1, 1, 0]);
+        assert!(Arc::ptr_eq(ids, cloned.repeated_term_ids.as_ref().unwrap()));
+        assert!(PhraseQuery::new(vec![term("a"), term("b")])
+            .repeated_term_ids
+            .is_none());
+    }
 
     #[test]
     fn test_phrase_match() {
