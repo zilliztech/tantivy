@@ -3,11 +3,15 @@ mod phrase_scorer;
 mod phrase_weight;
 pub mod regex_phrase_query;
 mod regex_phrase_weight;
+mod repeated_phrase_scorer;
+mod repeated_phrase_weight;
 
 pub use self::phrase_query::PhraseQuery;
 pub(crate) use self::phrase_scorer::intersection_count;
 pub use self::phrase_scorer::PhraseScorer;
 pub use self::phrase_weight::PhraseWeight;
+pub(crate) use self::repeated_phrase_scorer::RepeatedPhraseScorer;
+pub(crate) use self::repeated_phrase_weight::RepeatedPhraseWeight;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -122,6 +126,29 @@ pub(crate) mod tests {
         assert_eq!(test_query(vec!["b", "b"]), vec![0, 1]);
         assert!(test_query(vec!["g", "ewrwer"]).is_empty());
         assert!(test_query(vec!["g", "a"]).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_phrase_query_no_score_does_not_reuse_repeated_term_positions() -> crate::Result<()>
+    {
+        let index = create_index(&["a", "a a", "a x a", "a a a", "a b", "a a b", "a b a"])?;
+        let text_field = index.schema().get_field("text").unwrap();
+        let searcher = index.reader()?.searcher();
+        let count = |terms: &[&str], slop: u32| -> crate::Result<usize> {
+            let terms = terms
+                .iter()
+                .map(|text| Term::from_field_text(text_field, text))
+                .collect();
+            let mut phrase_query = PhraseQuery::new(terms);
+            phrase_query.set_slop(slop);
+            searcher.search(&phrase_query, &crate::collector::Count)
+        };
+
+        assert_eq!(count(&["a", "a"], 1)?, 5);
+        assert_eq!(count(&["a", "a", "a"], 2)?, 1);
+        assert_eq!(count(&["a", "b", "a"], 2)?, 2);
+        assert_eq!(count(&["a", "a", "b"], 0)?, 1);
         Ok(())
     }
 
