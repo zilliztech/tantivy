@@ -90,6 +90,7 @@ pub(crate) struct RepeatedPhraseScorer<TPostings: Postings> {
 /// query occurrences. For a lower bound on the adjusted positions, the earliest valid assignment
 /// minimizes the right endpoint. Raising the bound past the resulting left endpoint enumerates
 /// exactly the non-dominated frontier.
+/// An over-wide candidate raises the bound to `right - max_slop`, skipping impossible spans.
 ///
 /// Each offset's lower bound and predecessor index only increase, so its position cursor never
 /// needs to move backwards. With n positions, k offsets and F candidate rounds, this takes
@@ -151,6 +152,10 @@ fn build_repeated_term_frontier(
         let candidate = PositionSpan { left, right };
         if right - left <= max_slop {
             push_span_frontier(frontier, candidate);
+        } else {
+            // Greedy minimizes `right`; no valid span can start before `right - max_slop`.
+            min_adjusted_position = right - max_slop;
+            continue;
         }
         let Some(next_minimum) = left.checked_add(1) else {
             break;
@@ -499,6 +504,29 @@ mod tests {
         let mut spans = Vec::new();
         visit(positions, offsets, 0, 0, u32::MAX, 0, &mut spans);
         minimal_frontier(spans, max_slop)
+    }
+
+    #[test]
+    fn test_repeated_term_frontier_keeps_slop_pruning_boundary() {
+        let mut frontier = Vec::new();
+        let mut position_indices = Vec::new();
+        build_repeated_term_frontier(
+            &[0, 1, 9],
+            &[10, 0],
+            1,
+            &mut frontier,
+            &mut position_indices,
+        );
+        assert_eq!(frontier, vec![PositionSpan { left: 9, right: 10 }]);
+
+        build_repeated_term_frontier(
+            &[0, 1, 9],
+            &[10, 0],
+            0,
+            &mut frontier,
+            &mut position_indices,
+        );
+        assert!(frontier.is_empty());
     }
 
     #[test]
