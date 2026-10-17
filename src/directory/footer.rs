@@ -43,17 +43,17 @@ impl Footer {
     }
 
     pub fn extract_footer(file: FileSlice) -> io::Result<(Footer, FileSlice)> {
-        if file.len() < 4 {
+        let footer_metadata_len = <(u32, u32)>::SIZE_IN_BYTES;
+        if file.len() < footer_metadata_len {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 format!(
-                    "File corrupted. The file is smaller than 4 bytes (len={}).",
+                    "File corrupted. The file is smaller than {footer_metadata_len} bytes (len={}).",
                     file.len()
                 ),
             ));
         }
 
-        let footer_metadata_len = <(u32, u32)>::SIZE_IN_BYTES;
         let (footer_len, footer_magic_byte): (u32, u32) = file
             .slice_from_end(footer_metadata_len)
             .read_bytes()?
@@ -164,6 +164,14 @@ mod tests {
 
     use crate::directory::footer::{Footer, FOOTER_MAGIC_NUMBER};
     use crate::directory::{FileSlice, OwnedBytes};
+
+    #[test]
+    fn test_deserialize_truncated_footer_metadata() {
+        for len in 0..8 {
+            let err = Footer::extract_footer(FileSlice::from(vec![0; len])).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        }
+    }
 
     #[test]
     fn test_deserialize_footer() {

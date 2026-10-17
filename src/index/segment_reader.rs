@@ -6,6 +6,8 @@ use std::{fmt, io};
 use fnv::FnvHashMap;
 use itertools::Itertools;
 
+use common::HasLen;
+
 use crate::directory::{CompositeFile, FileSlice};
 use crate::error::DataCorruption;
 use crate::fastfield::{intersect_alive_bitsets, AliveBitSet, FacetReader, FastFieldReaders};
@@ -37,6 +39,7 @@ pub struct SegmentReader {
 
     max_doc: DocId,
     num_docs: DocId,
+    num_bytes: u64,
 
     termdict_composite: CompositeFile,
     postings_composite: CompositeFile,
@@ -61,6 +64,15 @@ impl SegmentReader {
     // FIXME: this is not accurate if user_specified_doc_id is enabled.
     pub fn num_docs(&self) -> DocId {
         self.num_docs
+    }
+
+    /// Returns the total length of this reader's segment component payloads,
+    /// excluding managed-file footers and temporary docstores.
+    ///
+    /// The value includes the reader's exact delete generation and remains
+    /// valid after obsolete component paths have been garbage collected.
+    pub fn num_bytes(&self) -> u64 {
+        self.num_bytes
     }
 
     /// Returns the schema of the index this segment belongs to.
@@ -159,9 +171,11 @@ impl SegmentReader {
 
         let postings_file = segment.open_read(SegmentComponent::Postings)?;
         let postings_composite = CompositeFile::open(&postings_file)?;
+        let mut num_bytes = (termdict_file.len() + store_file.len() + postings_file.len()) as u64;
 
         let positions_composite = {
             if let Ok(positions_file) = segment.open_read(SegmentComponent::Positions) {
+                num_bytes += positions_file.len() as u64;
                 CompositeFile::open(&positions_file)?
             } else {
                 CompositeFile::empty()
@@ -171,12 +185,15 @@ impl SegmentReader {
         let schema = segment.schema();
 
         let fast_fields_data = segment.open_read(SegmentComponent::FastFields)?;
+        num_bytes += fast_fields_data.len() as u64;
         let fast_fields_readers = FastFieldReaders::open(fast_fields_data, schema.clone())?;
         let fieldnorm_data = segment.open_read(SegmentComponent::FieldNorms)?;
+        num_bytes += fieldnorm_data.len() as u64;
         let fieldnorm_readers = FieldNormReaders::open(fieldnorm_data)?;
 
         let original_bitset = if segment.meta().has_deletes() {
             let alive_doc_file_slice = segment.open_read(SegmentComponent::Delete)?;
+            num_bytes += alive_doc_file_slice.len() as u64;
             let alive_doc_data = alive_doc_file_slice.read_bytes()?;
             Some(AliveBitSet::open(alive_doc_data))
         } else {
@@ -196,6 +213,7 @@ impl SegmentReader {
             inv_idx_reader_cache: Default::default(),
             num_docs,
             max_doc,
+            num_bytes,
             termdict_composite,
             postings_composite,
             fast_fields_readers,
@@ -520,6 +538,44 @@ mod test {
     use crate::index::Index;
     use crate::schema::{SchemaBuilder, Term, STORED, TEXT};
     use crate::IndexWriter;
+
+    #[test]
+    fn test_num_bytes_survives_merge_and_gc() -> crate::Result<()> {
+        use crate::directory::Directory;
+        use crate::merge_policy::NoMergePolicy;
+        use crate::schema::FAST;
+
+        let mut schema = Schema::builder();
+        let text = schema.add_text_field("text", TEXT | STORED | FAST);
+        let index = Index::create_in_ram(schema.build());
+        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        writer.add_document(doc!(text => "first document"))?;
+        writer.commit()?;
+        let (reader, expected, old_path) = {
+            let segment = index.searchable_segments()?.pop().unwrap();
+            let reader = SegmentReader::open(&segment)?;
+            let expected = SegmentComponent::iterator()
+                .filter(|component| **component != SegmentComponent::TempStore)
+                .filter_map(|component| segment.open_read(*component).ok())
+                .map(|file| file.len() as u64)
+                .sum::<u64>();
+            (
+                reader,
+                expected,
+                segment.relative_path(SegmentComponent::Terms),
+            )
+        };
+        assert!(expected > 0);
+        assert_eq!(reader.num_bytes(), expected);
+        writer.add_document(doc!(text => "second document"))?;
+        writer.commit()?;
+        writer.merge(&index.searchable_segment_ids()?).wait()?;
+        writer.garbage_collect_files().wait()?;
+        assert!(!index.directory().exists(&old_path)?);
+        assert_eq!(reader.num_bytes(), expected);
+        Ok(())
+    }
 
     #[test]
     fn test_merge_field_meta_data_same() {
