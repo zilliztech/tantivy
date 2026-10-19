@@ -48,7 +48,8 @@ impl Footer {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 format!(
-                    "File corrupted. The file is smaller than {footer_metadata_len} bytes (len={}).",
+                    "File corrupted. The file is smaller than {footer_metadata_len} bytes \
+                     (len={}).",
                     file.len()
                 ),
             ));

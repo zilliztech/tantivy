@@ -3,10 +3,9 @@ use std::ops::BitOrAssign;
 use std::sync::{Arc, RwLock};
 use std::{fmt, io};
 
+use common::HasLen;
 use fnv::FnvHashMap;
 use itertools::Itertools;
-
-use common::HasLen;
 
 use crate::directory::{CompositeFile, FileSlice};
 use crate::error::DataCorruption;
