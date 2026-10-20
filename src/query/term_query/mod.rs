@@ -7,12 +7,188 @@ pub use self::term_scorer::TermScorer;
 #[cfg(test)]
 mod tests {
 
-    use crate::collector::TopDocs;
-    use crate::docset::DocSet;
+    use std::collections::{BTreeMap, HashSet};
+
+    use crate::collector::{DocSetCollector, TopDocs};
+    use crate::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN};
+    use crate::merge_policy::NoMergePolicy;
     use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
+    use crate::query::weight::for_each_docset_buffered;
     use crate::query::{EnableScoring, Query, QueryParser, Scorer, TermQuery};
-    use crate::schema::{Field, IndexRecordOption, Schema, STRING, TEXT};
-    use crate::{assert_nearly_equals, DocAddress, Index, IndexWriter, Term, TERMINATED};
+    use crate::schema::{
+        Field, IndexRecordOption, OwnedValue, Schema, TextFieldIndexing, TextOptions, Value,
+        INDEXED, STORED, STRING, TEXT,
+    };
+    use crate::{
+        assert_nearly_equals, DocAddress, Index, IndexWriter, TantivyDocument, Term, TERMINATED,
+    };
+
+    #[test]
+    fn test_term_query_no_score_batches() -> crate::Result<()> {
+        use IndexRecordOption::{Basic, WithFreqs, WithFreqsAndPositions};
+
+        let mut builder = Schema::builder();
+        let string = builder.add_text_field("string", STRING);
+        let freqs = builder.add_text_field(
+            "freqs",
+            TextOptions::default()
+                .set_indexing_options(TextFieldIndexing::default().set_index_option(WithFreqs)),
+        );
+        let positions = builder.add_text_field("positions", TEXT);
+        let number = builder.add_u64_field("number", INDEXED);
+        let json = builder.add_json_field("json", TEXT);
+        let schema = builder.build();
+        let mut json_text = Term::from_field_json_path(json, "text", false);
+        json_text.append_type_and_str("needle");
+        let mut json_number = Term::from_field_json_path(json, "number", false);
+        json_number.append_type_and_fast_value(7i64);
+        let terms = [
+            (Term::from_field_text(string, "needle"), Basic),
+            (Term::from_field_text(freqs, "needle"), WithFreqs),
+            (
+                Term::from_field_text(positions, "needle"),
+                WithFreqsAndPositions,
+            ),
+            (Term::from_field_text(positions, "needle"), Basic),
+            (Term::from_field_u64(number, 7), Basic),
+            (json_text, WithFreqsAndPositions),
+            (json_number, Basic),
+        ];
+
+        for hits in [0, 1, 63, 64, 65, 127, 128, 129, 255, 256, 257] {
+            let index = Index::create_in_ram(schema.clone());
+            let mut writer: IndexWriter = index.writer_for_tests()?;
+            // Interleaved nonmatches make skipped, duplicated and padded IDs visible.
+            for row in 0..2 * hits + 3 {
+                let matches = row % 2 == 1 && row < 2 * hits;
+                let word = if matches { "needle" } else { "other" };
+                let words = format!("{word} {word} filler");
+                let value = if matches { 7u64 } else { 11u64 };
+                let mut document = doc!(
+                    string => word, freqs => words.clone(), positions => words.clone(),
+                    number => value
+                );
+                document.add_object(
+                    json,
+                    BTreeMap::from([
+                        ("text".to_string(), OwnedValue::Str(words)),
+                        ("number".to_string(), OwnedValue::I64(value as i64)),
+                    ]),
+                );
+                writer.add_document(document)?;
+            }
+            writer.commit()?;
+            let searcher = index.reader()?.searcher();
+            assert_eq!(searcher.segment_readers().len(), 1);
+            let segment = searcher.segment_reader(0);
+            let expected: Vec<u32> = (0..hits).map(|i| 2 * i + 1).collect();
+            let mut expected_batches: Vec<_> = expected
+                .chunks(COLLECT_BLOCK_BUFFER_LEN)
+                .map(<[u32]>::to_vec)
+                .collect();
+            // The buffered traversal emits an empty tail for zero/exactly full batches.
+            if hits as usize % COLLECT_BLOCK_BUFFER_LEN == 0 {
+                expected_batches.push(Vec::new());
+            }
+            for (term, option) in &terms {
+                let query = TermQuery::new(term.clone(), *option);
+                for scoring in [
+                    EnableScoring::disabled_from_schema(searcher.schema()),
+                    EnableScoring::disabled_from_searcher(&searcher),
+                    EnableScoring::enabled_from_searcher(&searcher),
+                ] {
+                    let weight = query.weight(scoring)?;
+                    let mut actual = Vec::new();
+                    weight.for_each_no_score(segment, &mut |docs| actual.push(docs.to_vec()))?;
+                    assert_eq!(actual, expected_batches, "hits={hits}, term={term:?}");
+                    let mut buffered = Vec::new();
+                    for_each_docset_buffered(
+                        &mut weight.scorer(segment, 1.0)?,
+                        &mut [0; COLLECT_BLOCK_BUFFER_LEN],
+                        |docs| buffered.push(docs.to_vec()),
+                    );
+                    assert_eq!(actual, buffered, "hits={hits}, term={term:?}");
+                }
+            }
+            // Deletion also uses this traversal. A later insert must survive, and
+            // the already-open searcher must keep its original snapshot.
+            let term = Term::from_field_text(string, "needle");
+            writer.add_document(doc!(string => "needle"))?;
+            writer.delete_term(term.clone());
+            writer.add_document(doc!(string => "needle"))?;
+            writer.commit()?;
+            let query = TermQuery::new(term, Basic);
+            assert_eq!(
+                searcher.search(&query, &DocSetCollector)?.len(),
+                hits as usize
+            );
+            let new_searcher = index.reader()?.searcher();
+            // Check the alive count independently of the query traversal.
+            assert_eq!(new_searcher.num_docs(), hits as u64 + 4);
+            assert_eq!(new_searcher.search(&query, &DocSetCollector)?.len(), 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_term_query_no_score_collector_with_deletes() -> crate::Result<()> {
+        let mut builder = Schema::builder();
+        let text = builder.add_text_field("text", STRING);
+        let row_id = builder.add_u64_field("row", INDEXED | STORED);
+        let index = Index::create_in_ram(builder.build());
+        let mut writer: IndexWriter = index.writer_for_tests()?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for row in 0..771u64 {
+            let word = if row % 2 == 1 { "needle" } else { "other" };
+            writer.add_document(doc!(text => word, row_id => row))?;
+            if row % 257 == 256 {
+                writer.commit()?;
+            }
+        }
+        // Keep the middle segment free of deletions: both collector paths must work.
+        let deleted = [1, 127, 256, 515, 767];
+        for row in deleted {
+            writer.delete_term(Term::from_field_u64(row_id, row));
+        }
+        writer.commit()?;
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 3);
+        assert_eq!(
+            searcher
+                .segment_readers()
+                .iter()
+                .filter(|s| s.alive_bitset().is_some())
+                .count(),
+            2
+        );
+        let query = TermQuery::new(
+            Term::from_field_text(text, "needle"),
+            IndexRecordOption::Basic,
+        );
+        let weight = query.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+        let mut expected_live = HashSet::new();
+        for (ordinal, segment) in searcher.segment_readers().iter().enumerate() {
+            let mut expected_raw = Vec::new();
+            for doc_id in 0..segment.max_doc() {
+                let address = DocAddress::new(ordinal as u32, doc_id);
+                let document: TantivyDocument = searcher.doc(address)?;
+                let row = document.get_first(row_id).unwrap().as_u64().unwrap();
+                // Derive the oracle from stored input, not postings or the alive bitset.
+                if row % 2 == 1 {
+                    expected_raw.push(doc_id);
+                    if !deleted.contains(&row) {
+                        expected_live.insert(address);
+                    }
+                }
+            }
+            let mut actual_raw = Vec::new();
+            weight.for_each_no_score(segment, &mut |docs| actual_raw.extend_from_slice(docs))?;
+            assert_eq!(actual_raw, expected_raw);
+        }
+        assert_eq!(expected_live.len(), 381);
+        assert_eq!(searcher.search(&query, &DocSetCollector)?, expected_live);
+        Ok(())
+    }
 
     #[test]
     pub fn test_term_query_no_freq() -> crate::Result<()> {
