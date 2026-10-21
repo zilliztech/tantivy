@@ -5,7 +5,7 @@ use crate::index::SegmentReader;
 use crate::postings::SegmentPostings;
 use crate::query::bm25::Bm25Weight;
 use crate::query::explanation::does_not_match;
-use crate::query::weight::{for_each_docset_buffered, for_each_scorer};
+use crate::query::weight::for_each_scorer;
 use crate::query::{Explanation, Scorer, Weight};
 use crate::schema::IndexRecordOption;
 use crate::{DocId, Score, Term};
@@ -56,16 +56,38 @@ impl Weight for TermWeight {
         Ok(())
     }
 
-    /// Iterates through all of the document matched by the DocSet
-    /// `DocSet` and push the scored documents to the collector.
+    /// Iterates through matching document IDs without computing scores.
     fn for_each_no_score(
         &self,
         reader: &SegmentReader,
         callback: &mut dyn FnMut(&[DocId]),
     ) -> crate::Result<()> {
-        let mut scorer = self.specialized_scorer(reader, 1.0)?;
-        let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
-        for_each_docset_buffered(&mut scorer, &mut buffer, callback);
+        // Full postings blocks must produce full collector batches.
+        const _: () = assert!(
+            crate::postings::compression::COMPRESSION_BLOCK_SIZE % COLLECT_BLOCK_BUFFER_LEN == 0
+        );
+        let inverted_index = reader.inverted_index(self.term.field())?;
+        let mut doc_freq = 0;
+        if let Some(mut postings) =
+            inverted_index.read_block_postings(&self.term, IndexRecordOption::Basic)?
+        {
+            doc_freq = postings.doc_freq() as usize;
+            loop {
+                let docs = postings.docs();
+                if docs.is_empty() {
+                    break;
+                }
+                // Borrow decoded IDs while retaining the collector's batch-size contract.
+                for docs in docs.chunks(COLLECT_BLOCK_BUFFER_LEN) {
+                    callback(docs);
+                }
+                postings.advance();
+            }
+        }
+        // The buffered traversal emits an empty final batch for these cases.
+        if doc_freq % COLLECT_BLOCK_BUFFER_LEN == 0 {
+            callback(&[]);
+        }
         Ok(())
     }
 
